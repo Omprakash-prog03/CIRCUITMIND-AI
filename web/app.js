@@ -49,14 +49,16 @@ function renderResult(project) {
   const artifactButtons = (project.artifacts || []).map((name) => name.endsWith('.raw') || name.endsWith('.pdf')
     ? `<a class="artifact-button" href="/api/projects/${encodeURIComponent(project.project_id)}/artifact/${encodeURIComponent(name)}" download>↓ &nbsp;Download ${escapeHtml(name)}</a>`
     : `<button class="artifact-button" data-artifact="${escapeHtml(name)}">↗ &nbsp;${escapeHtml(name)}</button>`).join('');
-  $('#view-result').innerHTML = `<div class="result-top"><div class="eyebrow"><span class="eyebrow-line"></span> ENGINEERING INTAKE COMPLETE</div><h1>${escapeHtml(project.name)}</h1><p>${escapeHtml(project.architecture)} architecture · Created ${escapeHtml(new Date(project.created_at).toLocaleString())}</p><div class="result-actions"><a class="primary-button" href="/api/projects/${encodeURIComponent(project.project_id)}/export"><span>Download project ZIP</span><span class="button-arrow">↓</span></a><button class="small-button" id="edit-circuit">Edit circuit model</button><button class="small-button" id="import-schematic">Import KiCad schematic</button><button class="small-button" id="run-kicad-erc">Run KiCad ERC</button><button class="small-button" id="import-board">Import KiCad PCB</button><button class="small-button" id="run-kicad-drc">Run KiCad DRC</button><button class="small-button" id="import-datasheet">Import datasheet PDF</button><button class="small-button" id="extract-datasheet-text">Extract latest PDF text</button><button class="small-button" id="import-spice">Import SPICE deck</button><button class="small-button" id="run-ngspice">Run ngspice</button><button class="small-button" id="show-snapshots">Snapshots</button><button class="small-button" id="back-to-brief">← New analysis</button></div></div>
+  $('#view-result').innerHTML = `<div class="result-top"><div class="eyebrow"><span class="eyebrow-line"></span> ENGINEERING INTAKE COMPLETE</div><h1>${escapeHtml(project.name)}</h1><p>${escapeHtml(project.architecture)} architecture · Created ${escapeHtml(new Date(project.created_at).toLocaleString())}</p><div class="result-actions"><a class="primary-button" href="/api/projects/${encodeURIComponent(project.project_id)}/export"><span>Download project ZIP</span><span class="button-arrow">↓</span></a><button class="small-button" id="edit-circuit">Edit circuit model</button><button class="small-button" id="run-led-resistor-calculation">Analyze LED resistor</button><button class="small-button" id="import-schematic">Import KiCad schematic</button><button class="small-button" id="run-kicad-erc">Run KiCad ERC</button><button class="small-button" id="import-board">Import KiCad PCB</button><button class="small-button" id="run-kicad-drc">Run KiCad DRC</button><button class="small-button" id="import-datasheet">Import datasheet PDF</button><button class="small-button" id="extract-datasheet-text">Extract latest PDF text</button><button class="small-button" id="import-spice">Import SPICE deck</button><button class="small-button" id="run-ngspice">Run ngspice</button><button class="small-button" id="show-snapshots">Snapshots</button><button class="small-button" id="back-to-brief">← New analysis</button></div></div>
   <div class="status-banner">⚠ &nbsp; Incomplete — this is requirements and feasibility analysis, not a completed electrical design.</div>
   <div class="result-grid"><div><section class="result-panel"><h2>Feasibility findings <span class="optional">${findings.length} ITEMS</span></h2>${findings.map((finding) => `<div class="finding"><span class="finding-icon">!</span><span>${escapeHtml(finding)}</span></div>`).join('')}</section>
   <section class="result-panel"><h2>Supplied component inventory</h2>${inventoryRows ? `<table class="inventory-table"><thead><tr><th>PART / DESCRIPTION</th><th>QTY</th><th>VERIFICATION</th></tr></thead><tbody>${inventoryRows}</tbody></table>` : '<div class="empty-state">No inventory provided.</div>'}</section></div>
-  <div><section class="result-panel"><h2>Validation ledger</h2>${statusLines}</section><section class="result-panel"><h2>Generated artifacts <span class="optional">${(project.artifacts||[]).length}</span></h2><div class="artifact-list">${artifactButtons}</div></section></div></div>`;
+  <div><section class="result-panel"><h2>Validation ledger</h2>${statusLines}</section><section class="result-panel"><h2>Engineering calculations</h2><p class="calc-explanation">“Current” means the report’s circuit-model hash matches this revision; it is not design approval.</p><div id="calculation-status"><div class="empty-state">Checking calculation revision status…</div></div></section><section class="result-panel"><h2>Generated artifacts <span class="optional">${(project.artifacts||[]).length}</span></h2><div class="artifact-list">${artifactButtons}</div></section></div></div>`;
   $('#view-result').querySelectorAll('[data-artifact]').forEach((button) => button.addEventListener('click', () => openArtifact(project.project_id, button.dataset.artifact)));
   $('#back-to-brief').addEventListener('click', () => showView('new'));
   $('#edit-circuit').addEventListener('click', openCircuitEditor);
+  $('#run-led-resistor-calculation').addEventListener('click', openLedResistorCalculation);
+  loadCalculationStatus(project.project_id);
   $('#import-schematic').addEventListener('click', () => $('#schematic-file').click());
   $('#run-kicad-erc').addEventListener('click', runKiCadErc);
   $('#import-board').addEventListener('click', () => $('#board-file').click());
@@ -79,6 +81,79 @@ async function openArtifact(projectId, filename) {
 function circuitFeedback(message, kind = '') {
   const node = $('#circuit-feedback'); node.textContent = message; node.className = `dialog-feedback ${kind}`;
 }
+async function loadCalculationStatus(projectId) {
+  const node = $('#calculation-status');
+  if (!node) return;
+  try {
+    const data = await (await request(`/api/projects/${encodeURIComponent(projectId)}/calculations`)).json();
+    if (!data.calculations?.length) { node.innerHTML = '<div class="empty-state">No project-bound calculations have been run.</div>'; return; }
+    node.innerHTML = [...data.calculations].reverse().map((item) => `<div class="validation-line"><span>${escapeHtml(item.kind.replaceAll('_',' '))}</span><span class="calc-state ${item.is_stale ? 'stale' : 'current'}">${item.status} · ${escapeHtml(new Date(item.created_at).toLocaleString())}</span></div>`).join('');
+  } catch (error) { node.textContent = `Calculation status unavailable: ${error.message}`; }
+}
+function openLedResistorCalculation() {
+  $('#led-calc-feedback').textContent = 'Calculations use the entered quantities and current saved-model revision; optional references identify parts but do not supply values.';
+  $('#led-calc-feedback').className = 'dialog-feedback';
+  $('#led-calc-dialog').showModal();
+}
+function optionalNumber(id) {
+  const raw = $(`#${id}`).value.trim();
+  if (!raw) return null;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) throw new Error(`${id} must be a finite number`);
+  return value;
+}
+function rangeInput(minId, maxId, unit, label) {
+  const minimum = optionalNumber(minId), maximum = optionalNumber(maxId);
+  if (minimum === null && maximum === null) return null;
+  if (minimum === null || maximum === null) throw new Error(`Enter both ${label} minimum and maximum, or leave both blank`);
+  return {min:{value:minimum, unit}, max:{value:maximum, unit}};
+}
+async function calculateLedResistor(event) {
+  event.preventDefault();
+  const feedback = $('#led-calc-feedback');
+  try {
+    const inputs = {
+      supply:{value:optionalNumber('calc-supply'), unit:'V'},
+      led_forward:{value:optionalNumber('calc-vf'), unit:'V'},
+      target_current:{value:optionalNumber('calc-current'), unit:'mA'},
+      resistor_tolerance_percent:optionalNumber('calc-tolerance'),
+      e_series:Number($('#calc-series').value),
+      power_derating_fraction:optionalNumber('calc-derating'),
+    };
+    const supplyRange = rangeInput('calc-supply-min','calc-supply-max','V','supply voltage');
+    const vfRange = rangeInput('calc-vf-min','calc-vf-max','V','LED forward voltage');
+    if (supplyRange) inputs.supply_range = supplyRange;
+    if (vfRange) inputs.led_forward_range = vfRange;
+    const maximumCurrent = optionalNumber('calc-max-current');
+    if (maximumCurrent !== null) inputs.maximum_current = {value:maximumCurrent, unit:'mA'};
+    const powerRating = optionalNumber('calc-power-rating');
+    if (powerRating !== null) inputs.resistor_power_rating = {value:powerRating, unit:'W'};
+    const source_refs = {};
+    for (const [role, id] of [['supply','calc-supply-ref'],['led','calc-led-ref'],['resistor','calc-resistor-ref']]) {
+      const reference = $(`#${id}`).value.trim(); if (reference) source_refs[role] = reference;
+    }
+    const response = await fetch(`/api/projects/${encodeURIComponent(currentProject.project_id)}/calculations/led-resistor`, {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({inputs, source_refs})
+    });
+    const report = await response.json();
+    if (!response.ok) throw new Error(report.error || `Calculation failed (${response.status})`);
+    const out = report.calculation.outputs;
+    const formatQuantity = (value) => value ? `${Number(value.value).toPrecision(5)} ${value.unit}` : 'not supplied';
+    feedback.textContent = `${report.calculation.name}\n${report.calculation.formula}\n${report.calculation.substitution}\nE-series candidate: ${formatQuantity(out.selected_resistance)} · Design status: ${out.design_status} · Nominal current: ${formatQuantity(out.nominal_current)}\nWorst-case current: ${formatQuantity(out.worst_case_minimum_current)} to ${formatQuantity(out.worst_case_maximum_current)} · Max resistor power: ${formatQuantity(out.resistor_maximum_power)}\nCurrent limit: ${out.compliance.maximum_current} · Power rating: ${out.compliance.resistor_power}\n${report.calculation.assumptions.join(' ')}\nBound to saved circuit SHA-256 ${report.circuit_model_sha256.slice(0,16)}…; report ${report.artifact}.`;
+    feedback.className = `dialog-feedback ${Object.values(out.compliance).includes('fail') ? 'error' : 'ok'}`;
+    await loadProjects();
+    currentProject = projectCache.find((project) => project.project_id === currentProject.project_id) || currentProject;
+    await loadCalculationStatus(currentProject.project_id);
+    const artifactList = $('#view-result .artifact-list');
+    if (artifactList && !artifactList.querySelector(`[data-artifact="${report.artifact}"]`)) {
+      const button = document.createElement('button'); button.className = 'artifact-button'; button.textContent = `↗  ${report.artifact}`;
+      button.addEventListener('click', () => openArtifact(currentProject.project_id, report.artifact)); artifactList.append(button);
+    }
+  } catch (error) {
+    feedback.textContent = error.message; feedback.className = 'dialog-feedback error';
+  }
+}
+
 async function openCircuitEditor() {
   if (!currentProject) return;
   try {
@@ -319,6 +394,7 @@ $('#spice-file').addEventListener('change', (event) => {
   const file = event.target.files?.[0]; event.target.value = '';
   importSpiceFile(file);
 });
+$('#led-calc-form').addEventListener('submit', calculateLedResistor);
 $('#circuit-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   try {

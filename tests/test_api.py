@@ -191,6 +191,43 @@ class CircuitApiTests(unittest.TestCase):
         self.assertIn("none was inferred", audit["components"][0]["reason"])
         self.assertEqual(audit["unresolved_count"], 1)
 
+    def test_led_calculation_is_revision_bound_and_marked_stale_after_model_edit(self):
+        _, created = self.call("/api/projects", {"name": "LED resistor math", "description": "Calculate from explicit electrical inputs", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        model = self.sample_design()
+        self.assertEqual(self.call(f"/api/projects/{project_id}/circuit", {"model": model}, "PUT")[0], 200)
+        inputs = {
+            "supply": {"value": 5, "unit": "V"},
+            "supply_range": {"min": {"value": 4.75, "unit": "V"}, "max": {"value": 5.25, "unit": "V"}},
+            "led_forward": {"value": 2, "unit": "V"},
+            "led_forward_range": {"min": {"value": 1.8, "unit": "V"}, "max": {"value": 2.2, "unit": "V"}},
+            "target_current": {"value": 10, "unit": "mA"},
+            "maximum_current": {"value": 20, "unit": "mA"},
+            "resistor_tolerance_percent": 5, "e_series": 24,
+            "resistor_power_rating": {"value": .25, "unit": "W"}, "power_derating_fraction": .5,
+        }
+        code, report = self.call(f"/api/projects/{project_id}/calculations/led-resistor", {"inputs": inputs}, "POST")
+        self.assertEqual(code, 201)
+        self.assertEqual(report["calculation"]["outputs"]["selected_resistance"], {"value": 300.0, "unit": "ohm"})
+        self.assertEqual(report["calculation"]["outputs"]["compliance"], {"maximum_current": "pass", "resistor_power": "pass"})
+        self.assertIn("explicit user-provided", report["input_values_source"])
+        code, history = self.call(f"/api/projects/{project_id}/calculations")
+        self.assertEqual(code, 200)
+        self.assertEqual(history["calculations"][-1]["status"], "current")
+        code, artifact = self.call(f"/api/projects/{project_id}/artifact/{report['artifact']}")
+        self.assertEqual(code, 200)
+        self.assertIn("circuit_model_sha256", artifact["content"])
+        changed_model = dict(model)
+        changed_model["limitations"] = list(model["limitations"]) + ["Changed revision for stale-result test"]
+        self.assertEqual(self.call(f"/api/projects/{project_id}/circuit", {"model": changed_model}, "PUT")[0], 200)
+        code, history = self.call(f"/api/projects/{project_id}/calculations")
+        self.assertEqual(code, 200)
+        self.assertEqual(history["calculations"][-1]["status"], "stale")
+        invalid = dict(inputs, supply={"value": 5, "unit": "mA"})
+        code, rejected = self.call(f"/api/projects/{project_id}/calculations/led-resistor", {"inputs": invalid}, "POST")
+        self.assertEqual(code, 422)
+        self.assertIn("voltage unit", rejected["error"])
+
     def test_datasheet_pdf_is_hash_linked_downloadable_and_extraction_attempt_is_honest(self):
         _, created = self.call("/api/projects", {"name": "Datasheet sources", "description": "Keep source evidence linked", "inventory": "", "architecture": "discrete"}, "POST")
         project_id = created["project_id"]

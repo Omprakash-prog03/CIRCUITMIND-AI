@@ -35,7 +35,8 @@ class CalculationTests(unittest.TestCase):
         self.assertAlmostEqual(result["frequency_hz"] * result["period_s"], 1)
 
     def test_invalid_calculation_inputs_fail_closed(self):
-        for fn, args in [(led_current_limit_resistor, (2, 5, .01)), (ne555_astable_frequency, (1, 0, 1)), (voltage_divider, (5, -1, 10))]:
+        for fn, args in [(led_current_limit_resistor, (2, 5, .01)), (ne555_astable_frequency, (1, 0, 1)), (voltage_divider, (5, -1, 10)),
+                         (ne555_astable_frequency, (1e308, 1e308, 1e-308)), (voltage_divider, (5, 1e308, 1e308))]:
             with self.subTest(fn=fn.__name__), self.assertRaises(ValueError):
                 fn(*args)
 

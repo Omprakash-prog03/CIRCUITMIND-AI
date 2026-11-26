@@ -25,10 +25,11 @@ The repository began as a README-only shell. Implement in vertical slices; each 
 - These are not OS/container sandboxes; do not run against untrusted files. CPU/memory/filesystem quotas and stronger process isolation remain future work. Input filtering cannot prove parser safety.
 - PlatformIO, Arduino CLI, firmware compilation, real native-tool execution in this environment, and hardened sandboxing remain unimplemented/unavailable. Tool probes are not validation results.
 
-## Milestone 4 — Datasheets, component library, calculations (source intake + raw text extraction implemented)
+## Milestone 4 — Datasheets, component library, calculations (source intake + raw text + first unit-aware calculation slice implemented)
 
 - Source-hashed PDF datasheet attachment with optional link to a saved component reference; optional Poppler `pdftotext` extraction retains page labels and source hash. Extraction is raw text only, not interpreted specifications or verified part data.
-- Verified part/variant and package identity, source-linked technical-parameter extraction with review/approval, expanded calculations (tolerances, operating corners, unit-aware values), and component compatibility checks remain pending.
+- The pure-Python math package now includes dimension-checked SI normalization, Ohm's law, resistor/capacitor networks, RC time constant, ideal stored energy, and an E-series LED-resistor analysis with worst-case current/power checks. Project reports retain model/input hashes and are surfaced stale after model edits. Its inputs are currently explicit manual values; they are not inferred from names or auto-populated from the circuit model.
+- Verified part/variant and package identity, source-linked parameter extraction with review/approval, expanded calculation families (tolerance propagation beyond this LED case, Monte Carlo, filters, semiconductor models), and component compatibility checks remain pending.
 - Explicit uncertainty, assumptions, and provenance on every inferred value.
 
 ## Milestone 5 — Firmware and hardware/software consistency

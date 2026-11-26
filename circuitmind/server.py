@@ -16,6 +16,7 @@ from . import __version__
 from .circuit_schema import export_kicad_netlist, migrate_model, validate_model
 from .integrations import discover_integrations, run_kicad_drc, run_kicad_erc, run_ngspice, run_pdftotext
 from .kicad_symbols import resolve_kicad_symbol
+from .engineering import led_series_resistor
 from .spice import validate_spice_deck
 from .models import ProjectInput
 from .project_store import list_snapshots, load_circuit, restore_snapshot, save_circuit
@@ -75,6 +76,32 @@ class Handler(BaseHTTPRequestHandler):
                         continue
             return self._json(200, {"projects": records})
         parts = parsed.path.strip("/").split("/")
+        if len(parts) == 4 and parts[:2] == ["api", "projects"] and parts[3] == "calculations":
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            try:
+                model = load_circuit(folder)
+                current_hash = hashlib.sha256(json.dumps(model, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+                reports = []
+                for report_path in folder.glob("calculation_led_resistor_*.json"):
+                    report = json.loads(report_path.read_text("utf-8"))
+                    stale = report.get("circuit_model_sha256") != current_hash
+                    calculation = report.get("calculation", {})
+                    reports.append({"run_id": report.get("run_id"), "kind": report.get("kind"),
+                                    "created_at": report.get("created_at"), "artifact": report_path.name,
+                                    "status": "stale" if stale else "current", "is_stale": stale,
+                                    "circuit_model_sha256": report.get("circuit_model_sha256"),
+                                    "inputs_sha256": report.get("inputs_sha256"),
+                                    "source_refs": report.get("source_refs", {}),
+                                    "outputs": calculation.get("outputs", {})})
+                reports.sort(key=lambda item: item.get("created_at", ""))
+                return self._json(200, {"circuit_model_sha256": current_hash, "calculations": reports})
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                return self._json(500, {"error": f"Calculation history could not be read: {exc}"})
         if len(parts) == 4 and parts[:2] == ["api", "projects"] and parts[3] == "datasheets":
             project_id = parts[2]
             if not _valid_id(project_id):
@@ -171,6 +198,58 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         parts = path.strip("/").split("/")
+        if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["calculations", "led-resistor"]:
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            try:
+                payload = self._read_payload(200_000)
+                inputs = payload.get("inputs")
+                if not isinstance(inputs, dict):
+                    raise ValueError("Request must include an 'inputs' object")
+                source_refs = payload.get("source_refs", {})
+                if not isinstance(source_refs, dict) or any(key not in {"supply", "led", "resistor"} for key in source_refs):
+                    raise ValueError("source_refs may contain only supply, led, and resistor component references")
+                with _project_tool_lock(project_id), _CIRCUIT_API_LOCK:
+                    model = load_circuit(folder)
+                    topology = validate_model(model)
+                    if not topology["topology_valid"]:
+                        return self._json(409, {"error": "Saved circuit model is invalid; calculations are not attached to an invalid revision", "topology_report": topology})
+                    refs = {component.get("reference") for component in model.get("components", [])}
+                    clean_refs = {}
+                    for role, reference in source_refs.items():
+                        if not isinstance(reference, str) or reference not in refs:
+                            raise ValueError(f"source_refs.{role} must name an existing saved component reference")
+                        clean_refs[role] = reference
+                    calculation = led_series_resistor(inputs)
+                    model_hash = hashlib.sha256(json.dumps(model, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+                    input_document = {"kind": "led_series_resistor", "inputs": inputs, "source_refs": clean_refs}
+                    input_hash = hashlib.sha256(json.dumps(input_document, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+                    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+                    report_name = f"calculation_led_resistor_{run_id}.json"
+                    report = {"run_id": run_id, "kind": "led_series_resistor", "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                              "circuit_model_sha256": model_hash, "inputs_sha256": input_hash,
+                              "source_refs": clean_refs, "input_values_source": "explicit user-provided quantities; not inferred from component descriptions",
+                              "dependency_status": "current-at-creation",
+                              "staleness_rule": "GET /api/projects/<id>/calculations compares circuit_model_sha256 to the current saved model; a changed model marks this report stale.",
+                              "calculation": calculation, "artifact": report_name}
+                    _atomic_bytes(folder / report_name, (json.dumps(report, indent=2, ensure_ascii=False) + "\n").encode())
+                    with (folder / "calculation_runs.jsonl").open("a", encoding="utf-8") as log:
+                        log.write(json.dumps({"run_id": run_id, "kind": report["kind"], "created_at": report["created_at"],
+                                              "circuit_model_sha256": model_hash, "inputs_sha256": input_hash, "artifact": report_name}, ensure_ascii=False) + "\n")
+                        log.flush()
+                        os.fsync(log.fileno())
+                    _update_project_record(folder)
+                return self._json(201, report)
+            except RequestTooLarge as exc:
+                return self._json(413, {"error": str(exc)})
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+                return self._json(422, {"error": str(exc)})
+            except OSError as exc:
+                return self._json(500, {"error": f"Calculation report could not be stored: {exc}"})
         if len(parts) == 6 and parts[:2] == ["api", "projects"] and parts[3] == "datasheets" and parts[5] == "extract":
             project_id, source_sha256 = parts[2], parts[4]
             if not _valid_id(project_id):
