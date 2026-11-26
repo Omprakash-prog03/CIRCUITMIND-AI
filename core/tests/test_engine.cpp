@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string_view>
 
+using circuitmind::AcCircuit;
 using circuitmind::Circuit;
 using circuitmind::Element;
 using circuitmind::ElementKind;
@@ -24,6 +25,45 @@ void testVoltageDividerDc() {
     assert(std::abs(result.node_voltages_v[1] - 10.0) < 1e-12);
     assert(std::abs(result.node_voltages_v[2] - 5.0) < 1e-12);
     assert(result.maximum_equation_residual < 1e-10);
+}
+
+void testShockleyDiodeNewtonOperatingPoint() {
+    Circuit circuit{3, 0, {
+        {ElementKind::VoltageSource, 1, 0, 5.0},
+        {ElementKind::Resistor, 1, 2, 1000.0},
+        {ElementKind::ShockleyDiode, 2, 0, 1e-12, 1.0, 300.0},
+    }};
+    const auto result = circuitmind::solveDc(circuit);
+    const double diode_voltage = result.node_voltages_v[2];
+    const double diode_current = result.element_currents_a[2];
+    assert(diode_voltage > 0.5 && diode_voltage < 0.7);
+    assert(diode_current > 0.0);
+    assert(std::abs((5.0 - diode_voltage) / 1000.0 - diode_current) < 1e-8);
+    assert(result.maximum_kcl_residual_a < 1e-8);
+    assert(std::abs(result.total_power_balance_w) < 1e-8);
+}
+
+void testPiecewiseLinearDiodeOperatingPoints() {
+    Circuit forward{3, 0, {
+        {ElementKind::VoltageSource, 1, 0, 5.0},
+        {ElementKind::Resistor, 1, 2, 1000.0},
+        {ElementKind::Diode, 2, 0, 0.7, 1e12},
+    }};
+    const auto forward_result = circuitmind::solveDc(forward);
+    assert(std::abs(forward_result.node_voltages_v[2] - 0.7) < 1e-10);
+    assert(std::abs(forward_result.element_currents_a[2] - 4.3e-3) < 1e-9);
+    assert(std::abs(forward_result.total_power_balance_w) < 1e-9);
+    assert(forward_result.maximum_equation_residual < 1e-9);
+
+    Circuit reverse{3, 0, {
+        {ElementKind::VoltageSource, 1, 0, -5.0},
+        {ElementKind::Resistor, 1, 2, 1000.0},
+        {ElementKind::Diode, 2, 0, 0.7, 1e12},
+    }};
+    const auto reverse_result = circuitmind::solveDc(reverse);
+    assert(std::abs(reverse_result.node_voltages_v[2] + 5.0) < 1e-8);
+    assert(reverse_result.element_currents_a[2] < 0.0);
+    assert(std::abs(reverse_result.element_currents_a[2] + 5e-12) < 1e-18);
 }
 
 void testIndependentCurrentSourceDirection() {
@@ -72,6 +112,153 @@ void testRejectedSingularAndUnboundedRequests() {
         (void)circuitmind::simulateTransientRc(circuit, {1e-6, 2001e-6, 2000});
     } catch (const circuitmind::SolverError&) { step_limit_rejected = true; }
     assert(step_limit_rejected);
+
+    bool inductor_rejected_by_dc = false;
+    try {
+        Circuit circuit{2, 0, {{ElementKind::Inductor, 1, 0, 1.0}}};
+        (void)circuitmind::solveDc(circuit);
+    } catch (const circuitmind::SolverError&) { inductor_rejected_by_dc = true; }
+    assert(inductor_rejected_by_dc);
+
+    bool shockley_parameter_rejected = false;
+    try {
+        Circuit circuit{2, 0, {{ElementKind::Resistor, 1, 0, 1000.0},
+                               {ElementKind::ShockleyDiode, 1, 0, 1e-2, 1.0, 300.0}}};
+        (void)circuitmind::solveDc(circuit);
+    } catch (const circuitmind::SolverError&) { shockley_parameter_rejected = true; }
+    assert(shockley_parameter_rejected);
+
+    bool mixed_diode_models_rejected = false;
+    try {
+        Circuit circuit{2, 0, {{ElementKind::Resistor, 1, 0, 1000.0},
+                               {ElementKind::Diode, 1, 0, 0.7, 1e12},
+                               {ElementKind::ShockleyDiode, 1, 0, 1e-12, 1.0, 300.0}}};
+        (void)circuitmind::solveDc(circuit);
+    } catch (const circuitmind::SolverError&) { mixed_diode_models_rejected = true; }
+    assert(mixed_diode_models_rejected);
+
+    bool shockley_rejected_by_transient = false;
+    try {
+        Circuit circuit{2, 0, {{ElementKind::Capacitor, 1, 0, 1e-6, 0.0},
+                               {ElementKind::Resistor, 1, 0, 1000.0},
+                               {ElementKind::ShockleyDiode, 1, 0, 1e-12, 1.0, 300.0}}};
+        (void)circuitmind::simulateTransientRc(circuit, {1e-6, 2e-6, 10});
+    } catch (const circuitmind::SolverError&) { shockley_rejected_by_transient = true; }
+    assert(shockley_rejected_by_transient);
+}
+
+void testAcSweepAndCAbi() {
+    constexpr double pi = 3.14159265358979323846;
+    const AcCircuit circuit{3, 0, {
+        {ElementKind::VoltageSource, 1, 0, 1.0, 0.0},
+        {ElementKind::Resistor, 1, 2, 1000.0, 0.0},
+        {ElementKind::Capacitor, 2, 0, 1.0 / (2.0 * pi * 1000.0 * 1000.0), 0.0},
+    }};
+    const auto result = circuitmind::simulateAcSweep(circuit, {100.0, 1000.0, 10000.0});
+    assert(result.frequency_points_hz.size() == 3);
+    assert(std::abs(result.node_voltage_real_v[1 * 3 + 2] - 0.5) < 1e-10);
+    assert(std::abs(result.node_voltage_imag_v[1 * 3 + 2] + 0.5) < 1e-10);
+    assert(result.normalized_equation_residuals[1] < 1e-12);
+
+    const AcCircuit rl_lowpass{3, 0, {
+        {ElementKind::VoltageSource, 1, 0, 1.0, 0.0},
+        {ElementKind::Inductor, 1, 2, 1000.0 / (2.0 * pi * 1000.0), 0.0},
+        {ElementKind::Resistor, 2, 0, 1000.0, 0.0},
+    }};
+    const auto rl_result = circuitmind::simulateAcSweep(rl_lowpass, {100.0, 1000.0, 10000.0});
+    assert(std::abs(rl_result.node_voltage_real_v[5] - 0.5) < 1e-10);
+    assert(std::abs(rl_result.node_voltage_imag_v[5] + 0.5) < 1e-10);
+
+    bool duplicate_frequency_rejected = false;
+    try { (void)circuitmind::simulateAcSweep(circuit, {100.0, 100.0}); }
+    catch (const circuitmind::SolverError&) { duplicate_frequency_rejected = true; }
+    assert(duplicate_frequency_rejected);
+
+    const cm_ac_element_v1 elements[] = {
+        {static_cast<uint32_t>(ElementKind::VoltageSource), 1, 0, 1.0, 0.0},
+        {static_cast<uint32_t>(ElementKind::Resistor), 1, 2, 1000.0, 0.0},
+        {static_cast<uint32_t>(ElementKind::Capacitor), 2, 0, 1.0 / (2.0 * pi * 1000.0 * 1000.0), 0.0},
+    };
+    const double frequencies[] = {100.0, 1000.0, 10000.0};
+    const cm_ac_sweep_request_v1 request{1, 3, 0, 3, elements, 3, frequencies};
+    double real[9]{}, imag[9]{}, residual[3]{};
+    cm_ac_sweep_result_v1 output{};
+    output.node_voltage_real_v = real; output.node_voltage_real_capacity = 9;
+    output.node_voltage_imag_v = imag; output.node_voltage_imag_capacity = 9;
+    output.normalized_equation_residuals = residual; output.residual_capacity = 3;
+    char error[256]{};
+    const int status = cm_engine_simulate_ac_sweep_v1(&request, &output, error, sizeof(error));
+    assert(status == 0);
+    assert(output.point_count == 3 && output.node_count == 3 && output.unknown_count == 3);
+    assert(std::abs(real[5] - 0.5) < 1e-10);
+    assert(std::abs(imag[5] + 0.5) < 1e-10);
+    output.node_voltage_real_capacity = 1;
+    const int short_buffer_status = cm_engine_simulate_ac_sweep_v1(&request, &output, error, sizeof(error));
+    assert(short_buffer_status != 0);
+    assert(std::string_view(error).find("too small") != std::string_view::npos);
+
+    const cm_ac_element_v1 rl_elements[] = {
+        {static_cast<uint32_t>(ElementKind::VoltageSource), 1, 0, 1.0, 0.0},
+        {static_cast<uint32_t>(ElementKind::Inductor), 1, 2, 1000.0 / (2.0 * pi * 1000.0), 0.0},
+        {static_cast<uint32_t>(ElementKind::Resistor), 2, 0, 1000.0, 0.0},
+    };
+    const cm_ac_sweep_request_v1 rl_request{1, 3, 0, 3, rl_elements, 3, frequencies};
+    output.node_voltage_real_capacity = 9;
+    const int rl_status = cm_engine_simulate_ac_sweep_v1(&rl_request, &output, error, sizeof(error));
+    assert(rl_status == 0);
+    assert(std::abs(real[5] - 0.5) < 1e-10);
+    assert(std::abs(imag[5] + 0.5) < 1e-10);
+}
+
+void testBackwardEulerRlStep() {
+    Circuit circuit{3, 0, {
+        {ElementKind::VoltageSource, 1, 0, 0.0, 0.0, 1.0, 0.1, true},
+        {ElementKind::Resistor, 1, 2, 1.0},
+        {ElementKind::Inductor, 2, 0, 1.0, 0.0},
+    }};
+    const auto result = circuitmind::simulateTransientRc(circuit, {0.1, 0.5, 10});
+    assert(result.step_count == 5);
+    // Series RL, with backward Euler: i[n] = (i[n-1] + dt*V/L) / (1 + dt*R/L).
+    double current = 0.0;
+    for (std::size_t step = 1; step <= 5; ++step) {
+        current = (current + 0.1) / 1.1;
+        const auto source = result.node_voltages_v[step * 3 + 1];
+        const auto inductor_top = result.node_voltages_v[step * 3 + 2];
+        assert(std::abs((source - inductor_top) - current) < 1e-11);
+    }
+    assert(result.maximum_equation_residual < 1e-10);
+}
+
+void testNativeDcSweepApi() {
+    Circuit circuit{3, 0, {
+        {ElementKind::VoltageSource, 1, 0, 1.0},
+        {ElementKind::Resistor, 1, 2, 1000.0},
+        {ElementKind::Resistor, 2, 0, 1000.0},
+    }};
+    const auto solved = circuitmind::simulateDcSweep(circuit, 0, {0.0, 5.0, 10.0});
+    assert(solved.node_count == 3);
+    assert(std::abs(solved.node_voltage_traces_v[2] - 0.0) < 1e-12);
+    assert(std::abs(solved.node_voltage_traces_v[3 + 2] - 2.5) < 1e-12);
+    assert(std::abs(solved.node_voltage_traces_v[2 * 3 + 2] - 5.0) < 1e-12);
+
+    const cm_element_v1 elements[] = {
+        {static_cast<uint32_t>(ElementKind::VoltageSource), 1, 0, 1.0, 0.0, 0.0, 0.0, 0},
+        {static_cast<uint32_t>(ElementKind::Resistor), 1, 2, 1000.0, 0.0, 0.0, 0.0, 0},
+        {static_cast<uint32_t>(ElementKind::Resistor), 2, 0, 1000.0, 0.0, 0.0, 0.0, 0},
+    };
+    const cm_dc_request_v1 dc_request{1, 3, 0, 3, elements};
+    const double values[] = {0.0, 5.0, 10.0};
+    const cm_dc_sweep_request_v1 request{1, dc_request, 0, 3, values};
+    double node_traces[9]{}, max_residuals[3]{}, normalized_residuals[3]{};
+    cm_dc_sweep_result_v1 output{node_traces, 9, max_residuals, 3, normalized_residuals, 3};
+    char error[256]{};
+    const int status = cm_engine_simulate_dc_sweep_v1(&request, &output, error, sizeof(error));
+    assert(status == 0);
+    assert(output.point_count == 3 && output.node_count == 3);
+    assert(std::abs(node_traces[2] - 0.0) < 1e-12);
+    assert(std::abs(node_traces[5] - 2.5) < 1e-12);
+    assert(std::abs(node_traces[8] - 5.0) < 1e-12);
+    assert(max_residuals[0] < 1e-10 && max_residuals[1] < 1e-10 && max_residuals[2] < 1e-10);
 }
 
 void testCAbiRoundTrip() {
@@ -119,9 +306,13 @@ void testCAbiRoundTrip() {
 
 int main() {
     testVoltageDividerDc();
+    testShockleyDiodeNewtonOperatingPoint();
+    testPiecewiseLinearDiodeOperatingPoints();
     testIndependentCurrentSourceDirection();
     testBackwardEulerRcStep();
     testRejectedSingularAndUnboundedRequests();
+    testAcSweepAndCAbi();
+    testNativeDcSweepApi();
     testCAbiRoundTrip();
     std::cout << "CircuitMind C++ core tests passed\n";
 }

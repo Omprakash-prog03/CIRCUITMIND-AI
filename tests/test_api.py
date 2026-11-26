@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import tempfile
 import threading
@@ -296,6 +297,83 @@ class CircuitApiTests(unittest.TestCase):
         self.assertEqual(summary["outputs"]["sample_count"], 11)
         self.assertNotIn("node_voltage_traces_v", summary["outputs"])
 
+    def test_graph_bound_rlc_transient_uses_native_inductor_state_and_persists_history(self):
+        _, created = self.call("/api/projects", {"name": "RL transient", "description": "Explicit series RL step", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        pins = [{"number": "1", "name": "A", "type": "passive"}, {"number": "2", "name": "B", "type": "passive"}]
+        components = [{"reference": ref, "value": "not an electrical model", "symbol": None, "footprint": None,
+                       "datasheet": None, "pins": [dict(pin) for pin in pins],
+                       "position_mm": {"x": x, "y": 10}, "rotation_deg": 0}
+                      for ref, x in (("V1", 10), ("R1", 20), ("L1", 30))]
+        model = {"schema_version": 2, "metadata": {"units": "mm", "grid_mm": 1.27}, "status": "draft",
+                 "components": components,
+                 "nets": [{"name": "VIN", "terminals": [{"reference": "V1", "pin": "1"}, {"reference": "R1", "pin": "1"}]},
+                          {"name": "LTOP", "terminals": [{"reference": "R1", "pin": "2"}, {"reference": "L1", "pin": "1"}]},
+                          {"name": "GND", "terminals": [{"reference": "V1", "pin": "2"}, {"reference": "L1", "pin": "2"}]}],
+                 "inventory": [], "limitations": []}
+        self.assertEqual(self.call(f"/api/projects/{project_id}/circuit", {"model": model}, "PUT")[0], 200)
+        mapping = {"ground_net": "GND", "bindings": [
+            {"reference": "V1", "type": "voltage_source", "pins": ["1", "2"],
+             "value": {"type": "step", "initial": {"value": 0, "unit": "V"},
+                       "final": {"value": 1, "unit": "V"}, "step_time": {"value": 0.1, "unit": "s"}}},
+            {"reference": "R1", "type": "resistor", "pins": ["1", "2"], "value": {"value": 1, "unit": "ohm"}},
+            {"reference": "L1", "type": "inductor", "pins": ["1", "2"],
+             "value": {"value": 1, "unit": "H"}, "initial_current": {"value": 0, "unit": "A"}},
+        ], "exclusions": []}
+        code, report = self.call(f"/api/projects/{project_id}/simulations/transient-rlc/from-model", {
+            "mapping": mapping, "time_step": {"value": 0.1, "unit": "s"},
+            "stop_time": {"value": 0.5, "unit": "s"}}, "POST")
+        self.assertEqual(code, 201)
+        self.assertEqual(report["kind"], "circuit_graph_bound_linear_rlc_transient")
+        outputs = report["calculation"]["outputs"]
+        self.assertAlmostEqual(outputs["inductor_current_traces_a"]["L1"][-1],
+                               sum((1 / 11) * (10 / 11) ** index for index in range(5)), places=11)
+        _, history = self.call(f"/api/projects/{project_id}/simulations")
+        self.assertEqual(history["simulations"][-1]["mapping_status"], "intact")
+        self.assertEqual(history["simulations"][-1]["outputs"]["final_inductor_currents_a"]["L1"],
+                         outputs["inductor_current_traces_a"]["L1"][-1])
+
+    def test_graph_bound_ac_sweep_uses_connectivity_and_explicit_phasor_mapping(self):
+        _, created = self.call("/api/projects", {"name": "Graph-bound AC", "description": "Explicit graph mapped sweep", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        pins = [{"number": "1", "name": "A", "type": "passive"}, {"number": "2", "name": "B", "type": "passive"}]
+        components = [{"reference": ref, "value": "unverified description", "symbol": None, "footprint": None,
+                       "datasheet": None, "pins": [dict(pin) for pin in pins],
+                       "position_mm": {"x": x, "y": 10}, "rotation_deg": 0}
+                      for ref, x in (("V1", 10), ("L1", 20), ("R1", 30))]
+        model = {"schema_version": 2, "metadata": {"units": "mm", "grid_mm": 1.27}, "status": "draft",
+                 "components": components,
+                 "nets": [{"name": "VIN", "terminals": [{"reference": "V1", "pin": "1"}, {"reference": "L1", "pin": "1"}]},
+                          {"name": "OUT", "terminals": [{"reference": "L1", "pin": "2"}, {"reference": "R1", "pin": "1"}]},
+                          {"name": "GND", "terminals": [{"reference": "V1", "pin": "2"}, {"reference": "R1", "pin": "2"}]}],
+                 "inventory": [], "limitations": []}
+        self.assertEqual(self.call(f"/api/projects/{project_id}/circuit", {"model": model}, "PUT")[0], 200)
+        cutoff = 1000.0
+        mapping = {"ground_net": "GND", "bindings": [
+            {"reference": "V1", "type": "voltage_source", "pins": ["1", "2"],
+             "value": {"value": 1, "unit": "V"}, "phase_degrees": 0},
+            {"reference": "L1", "type": "inductor", "pins": ["1", "2"],
+             "value": {"value": 1000 / (2 * math.pi * cutoff), "unit": "H"}},
+            {"reference": "R1", "type": "resistor", "pins": ["1", "2"],
+             "value": {"value": 1, "unit": "kohm"}},
+        ], "exclusions": []}
+        sweep = {"start_frequency": {"value": 100, "unit": "Hz"},
+                 "stop_frequency": {"value": 10000, "unit": "Hz"}, "points": 3, "scale": "log"}
+        code, report = self.call(f"/api/projects/{project_id}/simulations/ac-sweep/from-model",
+                                 {"mapping": mapping, "frequency_sweep": sweep}, "POST")
+        self.assertEqual(code, 201)
+        self.assertEqual(report["kind"], "circuit_graph_bound_linear_ac_sweep")
+        self.assertTrue(report["component_coverage"]["all_components_accounted"])
+        node = report["mapping_report"]["net_name_to_solver_node"]["OUT"]
+        self.assertAlmostEqual(report["calculation"]["outputs"]["node_voltage_magnitude_traces_v"][node][1],
+                               1 / math.sqrt(2), places=10)
+        code, history = self.call(f"/api/projects/{project_id}/simulations")
+        self.assertEqual(code, 200)
+        summary = history["simulations"][-1]
+        self.assertEqual(summary["mapping_status"], "intact")
+        self.assertEqual(summary["netlist_status"], "intact")
+        self.assertEqual(summary["outputs"]["frequency_point_count"], 3)
+
     def test_graph_bound_mna_requires_explicit_complete_component_mapping(self):
         _, created = self.call("/api/projects", {"name": "Graph-bound MNA", "description": "Explicit net mapping", "inventory": "", "architecture": "discrete"}, "POST")
         project_id = created["project_id"]
@@ -333,6 +411,90 @@ class CircuitApiTests(unittest.TestCase):
         self.assertTrue(partial_report["component_coverage"]["has_exclusions"])
         self.assertTrue(any("partial model" in warning for warning in partial_report["calculation"]["warnings"]))
 
+    def test_linear_dc_source_sweep_is_computed_and_persisted(self):
+        _, created = self.call("/api/projects", {"name": "DC sweep", "description": "Source sweep", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        model = self.sample_design()
+        self.assertEqual(self.call(f"/api/projects/{project_id}/circuit", {"model": model}, "PUT")[0], 200)
+        netlist = {"ground": "0", "elements": [
+            {"type": "voltage_source", "reference": "V1", "nodes": ["VIN", "0"], "voltage": {"value": 1, "unit": "V"}},
+            {"type": "resistor", "reference": "R1", "nodes": ["VIN", "MID"], "resistance": {"value": 1, "unit": "kohm"}},
+            {"type": "resistor", "reference": "R2", "nodes": ["MID", "0"], "resistance": {"value": 1, "unit": "kohm"}},
+        ]}
+        sweep = {"reference": "V1", "start_value": {"value": 0, "unit": "V"},
+                 "stop_value": {"value": 10, "unit": "V"}, "points": 3, "scale": "linear"}
+        code, report = self.call(f"/api/projects/{project_id}/simulations/dc-sweep",
+                                 {"netlist": netlist, "sweep": sweep}, "POST")
+        self.assertEqual(code, 201)
+        self.assertEqual(report["kind"], "linear_dc_source_sweep")
+        self.assertEqual(report["calculation"]["outputs"]["sweep_values"], [0, 5, 10])
+        self.assertEqual(report["calculation"]["outputs"]["node_voltage_traces_v"]["MID"], [0, 2.5, 5])
+        code, history = self.call(f"/api/projects/{project_id}/simulations")
+        self.assertEqual(code, 200)
+        summary = history["simulations"][-1]
+        self.assertEqual(summary["netlist_status"], "intact")
+        self.assertEqual(summary["outputs"]["point_count"], 3)
+        self.assertEqual(summary["outputs"]["final_node_voltages_v"]["MID"], 5)
+        self.assertNotIn("node_voltage_traces_v", summary["outputs"])
+
+    def test_graph_bound_dc_sweep_uses_explicit_mapped_source(self):
+        _, created = self.call("/api/projects", {"name": "Graph DC sweep", "description": "Mapped source sweep", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        model = self.mna_design()
+        self.assertEqual(self.call(f"/api/projects/{project_id}/circuit", {"model": model}, "PUT")[0], 200)
+        mapping = {"ground_net": "GND", "bindings": [
+            {"reference": "V1", "type": "voltage_source", "pins": ["1", "2"], "value": {"value": 1, "unit": "V"}},
+            {"reference": "R1", "type": "resistor", "pins": ["1", "2"], "value": {"value": 1, "unit": "kohm"}},
+            {"reference": "R2", "type": "resistor", "pins": ["1", "2"], "value": {"value": 1, "unit": "kohm"}},
+        ], "exclusions": []}
+        sweep = {"reference": "V1", "start_value": {"value": 0, "unit": "V"},
+                 "stop_value": {"value": 10, "unit": "V"}, "points": 3, "scale": "linear"}
+        code, report = self.call(f"/api/projects/{project_id}/simulations/dc-sweep/from-model",
+                                 {"mapping": mapping, "sweep": sweep}, "POST")
+        self.assertEqual(code, 201)
+        self.assertEqual(report["kind"], "circuit_graph_bound_linear_dc_source_sweep")
+        node = report["mapping_report"]["net_name_to_solver_node"]["MID"]
+        self.assertEqual(report["calculation"]["outputs"]["node_voltage_traces_v"][node], [0, 2.5, 5])
+        code, history = self.call(f"/api/projects/{project_id}/simulations")
+        self.assertEqual(code, 200)
+        self.assertEqual(history["simulations"][-1]["mapping_status"], "intact")
+        self.assertEqual(history["simulations"][-1]["netlist_status"], "intact")
+
+    def test_linear_ac_sweep_is_persisted_with_bounded_history_summary(self):
+        _, created = self.call("/api/projects", {"name": "AC sweep", "description": "Explicit linear R/C response", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        model = self.sample_design()
+        self.assertEqual(self.call(f"/api/projects/{project_id}/circuit", {"model": model}, "PUT")[0], 200)
+        cutoff = 1000.0
+        netlist = {
+            "ground": "0",
+            "frequency_sweep": {"start_frequency": {"value": 100, "unit": "Hz"},
+                                "stop_frequency": {"value": 10000, "unit": "Hz"}, "points": 3, "scale": "log"},
+            "elements": [
+                {"type": "voltage_source", "reference": "V1", "nodes": ["VIN", "0"],
+                 "voltage": {"value": 1, "unit": "V"}, "phase_degrees": 0},
+                {"type": "resistor", "reference": "R1", "nodes": ["VIN", "OUT"],
+                 "resistance": {"value": 1, "unit": "kohm"}},
+                {"type": "capacitor", "reference": "C1", "nodes": ["OUT", "0"],
+                 "capacitance": {"value": 1 / (2 * math.pi * cutoff * 1000), "unit": "F"}},
+            ],
+        }
+        code, report = self.call(f"/api/projects/{project_id}/simulations/ac-sweep", {"netlist": netlist}, "POST")
+        self.assertEqual(code, 201)
+        self.assertEqual(report["kind"], "linear_ac_sweep")
+        outputs = report["calculation"]["outputs"]
+        self.assertAlmostEqual(outputs["node_voltage_magnitude_traces_v"]["OUT"][1], 1 / math.sqrt(2), places=10)
+        self.assertAlmostEqual(outputs["node_voltage_phase_traces_deg"]["OUT"][1], -45, places=9)
+        code, history = self.call(f"/api/projects/{project_id}/simulations")
+        self.assertEqual(code, 200)
+        summary = history["simulations"][-1]
+        self.assertEqual(summary["kind"], "linear_ac_sweep")
+        self.assertEqual(summary["netlist_status"], "intact")
+        self.assertEqual(summary["outputs"]["frequency_point_count"], 3)
+        self.assertAlmostEqual(summary["outputs"]["final_node_voltage_magnitudes_v"]["OUT"],
+                               outputs["node_voltage_magnitude_traces_v"]["OUT"][-1])
+        self.assertNotIn("node_voltage_magnitude_traces_v", summary["outputs"])
+
     def test_linear_dc_mna_report_preserves_netlist_hash_and_model_association(self):
         _, created = self.call("/api/projects", {"name": "MNA DC check", "description": "Explicit linear DC model", "inventory": "", "architecture": "discrete"}, "POST")
         project_id = created["project_id"]
@@ -363,6 +525,48 @@ class CircuitApiTests(unittest.TestCase):
         code, error = self.call(f"/api/projects/{project_id}/simulations/dc-operating-point", {"netlist": singular}, "POST")
         self.assertEqual(code, 422)
         self.assertIn("singular", error["error"])
+
+    def test_piecewise_linear_diode_dc_solve_is_persisted(self):
+        _, created = self.call("/api/projects", {"name": "Diode DC", "description": "Explicit piecewise-linear diode test", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        netlist = {"ground": "0", "elements": [
+            {"type": "voltage_source", "reference": "V1", "nodes": ["VIN", "0"],
+             "voltage": {"value": 5, "unit": "V"}},
+            {"type": "resistor", "reference": "R1", "nodes": ["VIN", "OUT"],
+             "resistance": {"value": 1, "unit": "kohm"}},
+            {"type": "diode", "reference": "D1", "nodes": ["OUT", "0"],
+             "forward_voltage": {"value": 0.7, "unit": "V"},
+             "off_resistance": {"value": 1e12, "unit": "ohm"}},
+        ]}
+        code, report = self.call(f"/api/projects/{project_id}/simulations/dc-operating-point", {"netlist": netlist}, "POST")
+        self.assertEqual(code, 201)
+        self.assertEqual(report["kind"], "piecewise_linear_diode_dc_operating_point")
+        self.assertEqual(report["calculation"]["outputs"]["solver_status"], "solved-piecewise-linear-diode-dc-model")
+        self.assertAlmostEqual(report["calculation"]["outputs"]["node_voltages"]["OUT"]["value"], 0.7, places=9)
+        history_code, history = self.call(f"/api/projects/{project_id}/simulations")
+        self.assertEqual(history_code, 200)
+        self.assertEqual(history["simulations"][-1]["netlist_status"], "intact")
+
+    def test_shockley_diode_dc_solve_is_persisted_and_listed(self):
+        _, created = self.call("/api/projects", {"name": "Shockley DC", "description": "Bounded Shockley model test", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        netlist = {"ground": "0", "elements": [
+            {"type": "voltage_source", "reference": "V1", "nodes": ["VIN", "0"],
+             "voltage": {"value": 5, "unit": "V"}},
+            {"type": "resistor", "reference": "R1", "nodes": ["VIN", "OUT"],
+             "resistance": {"value": 1, "unit": "kohm"}},
+            {"type": "shockley_diode", "reference": "D1", "nodes": ["OUT", "0"],
+             "saturation_current": {"value": 1e-12, "unit": "A"},
+             "ideality_factor": 1.0, "temperature_kelvin": {"value": 300, "unit": "K"}},
+        ]}
+        code, report = self.call(f"/api/projects/{project_id}/simulations/dc-operating-point", {"netlist": netlist}, "POST")
+        self.assertEqual(code, 201)
+        self.assertEqual(report["kind"], "shockley_diode_dc_operating_point")
+        self.assertEqual(report["calculation"]["outputs"]["solver_status"], "solved-shockley-diode-newton-dc-model")
+        history_code, history = self.call(f"/api/projects/{project_id}/simulations")
+        self.assertEqual(history_code, 200)
+        self.assertEqual(history["simulations"][-1]["kind"], "shockley_diode_dc_operating_point")
+        self.assertEqual(history["simulations"][-1]["netlist_status"], "intact")
 
     def test_clock_divider_candidate_is_saved_as_math_not_implementation_approval(self):
         _, created = self.call("/api/projects", {"name": "Divider candidate", "description": "Clock rate planning", "inventory": "", "architecture": "discrete"}, "POST")

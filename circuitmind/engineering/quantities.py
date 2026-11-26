@@ -15,6 +15,7 @@ _UNITS: dict[str, tuple[str, float, str]] = {
     "W": ("power", 1.0, "W"), "mW": ("power", 1e-3, "W"), "uW": ("power", 1e-6, "W"), "µW": ("power", 1e-6, "W"),
     "s": ("time", 1.0, "s"), "ms": ("time", 1e-3, "s"), "us": ("time", 1e-6, "s"), "µs": ("time", 1e-6, "s"), "ns": ("time", 1e-9, "s"),
     "Hz": ("frequency", 1.0, "Hz"), "kHz": ("frequency", 1e3, "Hz"), "MHz": ("frequency", 1e6, "Hz"),
+    "K": ("temperature", 1.0, "K"),
 }
 
 

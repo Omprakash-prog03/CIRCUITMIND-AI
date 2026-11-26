@@ -21,6 +21,7 @@ class RcLowpassSynthesisTests(unittest.TestCase):
     def test_generates_valid_graph_and_checks_nominal_rc_response(self):
         report = synthesize_rc_lowpass(self.inputs)
         self.assertEqual(report["workflow"], "single-pole-rc-low-pass-synthesis")
+        self.assertEqual(report["workflow_version"], 2)
         self.assertEqual(report["design_status"], "candidate-meets-nominal-cutoff-constraint")
         self.assertEqual(report["selected_values"]["resistance"]["value"], 10_000)
         self.assertEqual(report["selected_values"]["capacitance"]["value"], 16e-9)
@@ -35,6 +36,17 @@ class RcLowpassSynthesisTests(unittest.TestCase):
         self.assertLess(test["absolute_final_value_error"]["value"], 0.001)
         self.assertIn("a KiCad schematic", report["scope"])
         self.assertIsNone(report["circuit_model_candidate"]["components"][0]["symbol"])
+
+    def test_global_search_finds_feasible_pair_away_from_preferred_resistance(self):
+        inputs = {**self.inputs, "cutoff_frequency": {"value": 1e9, "unit": "Hz"},
+                  "preferred_resistance": {"value": 100e6, "unit": "ohm"}}
+        report = synthesize_rc_lowpass(inputs)
+        selected = report["selected_values"]
+        self.assertEqual(report["constraints"]["nominal_cutoff_error"], "pass")
+        self.assertLess(abs(report["selected_values"]["nominal_cutoff_error_percent"]), 5)
+        self.assertNotEqual(selected["resistance"]["value"], inputs["preferred_resistance"]["value"])
+        self.assertEqual(report["optimization"]["status"], "preferred-resistance-optimized-within-cutoff-bound")
+        self.assertGreater(report["optimization"]["evaluated_resistance_candidates"], 100)
 
     def test_reports_hard_cutoff_error_failure_and_tolerance_bounds(self):
         inputs = {**self.inputs, "max_cutoff_error_percent": 0.1}
@@ -53,8 +65,6 @@ class RcLowpassSynthesisTests(unittest.TestCase):
             {**self.inputs, "preferred_resistance": {"value": 1e-3, "unit": "ohm"}},
             {**self.inputs, "resistor_tolerance_percent": 51},
             {**self.inputs, "max_cutoff_error_percent": 0},
-            {**self.inputs, "cutoff_frequency": {"value": 1e9, "unit": "Hz"},
-             "preferred_resistance": {"value": 100e6, "unit": "ohm"}},
         ]
         for inputs in bad:
             with self.subTest(inputs=inputs), self.assertRaises(ValueError):

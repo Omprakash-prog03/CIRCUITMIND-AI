@@ -13,17 +13,20 @@ enum class ElementKind : std::uint32_t {
     Capacitor = 1,
     VoltageSource = 2,
     CurrentSource = 3,
+    Inductor = 4, // Accepted by AC and backward-Euler transient analysis; not DC operating point.
+    Diode = 5, // DC piecewise-linear model with explicit forward drop and off resistance.
+    ShockleyDiode = 6, // DC exponential junction model with explicit Is, n, and temperature.
 };
 
 struct Element {
     ElementKind kind{};
     std::size_t node_a{};
     std::size_t node_b{};
-    // R (ohm), C (farad), or constant source value (V/A), according to kind.
+    // R (ohm), C (farad), L (henry), or constant source value (V/A), according to kind.
     double value{};
-    // Capacitor initial voltage; source step low/high values when has_step is true.
+    // Capacitor initial voltage; diode off resistance; Shockley ideality factor; source step low value when has_step is true.
     double initial_value{};
-    double final_value{};
+    double final_value{}; // source step high value or Shockley diode temperature in kelvin.
     double step_time_s{};
     bool has_step{};
 };
@@ -49,6 +52,15 @@ struct DcResult {
     std::size_t unknown_count{};
 };
 
+struct DcSweepResult {
+    // Row-major: sweep sample * node_count + node index.
+    std::vector<double> node_voltage_traces_v;
+    std::vector<double> maximum_equation_residuals;
+    std::vector<double> normalized_equation_residuals;
+    std::size_t node_count{};
+    std::size_t unknown_count{};
+};
+
 struct TransientOptions {
     double time_step_s{};
     double stop_time_s{};
@@ -65,6 +77,32 @@ struct TransientResult {
     double maximum_equation_residual{};
 };
 
+struct AcElement {
+    ElementKind kind{};
+    std::size_t node_a{};
+    std::size_t node_b{};
+    // R (ohm), C (farad), L (henry), or AC source magnitude in RMS units (V/A).
+    double value{};
+    // AC source phase in radians; ignored for passive elements and required to be zero there.
+    double phase_rad{};
+};
+
+struct AcCircuit {
+    std::size_t node_count{};
+    std::size_t ground_index{};
+    std::vector<AcElement> elements;
+};
+
+struct AcSweepResult {
+    std::vector<double> frequency_points_hz;
+    // Row-major: sample index * node_count + node index. Complex voltages split into real/imaginary arrays.
+    std::vector<double> node_voltage_real_v;
+    std::vector<double> node_voltage_imag_v;
+    std::vector<double> normalized_equation_residuals;
+    std::size_t node_count{};
+    std::size_t unknown_count{};
+};
+
 class SolverError : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
@@ -72,6 +110,9 @@ public:
 
 [[nodiscard]] const char* engineVersion() noexcept;
 [[nodiscard]] DcResult solveDc(const Circuit& circuit);
+[[nodiscard]] DcSweepResult simulateDcSweep(const Circuit& circuit, std::size_t element_index,
+                                            const std::vector<double>& source_values);
 [[nodiscard]] TransientResult simulateTransientRc(const Circuit& circuit, const TransientOptions& options);
+[[nodiscard]] AcSweepResult simulateAcSweep(const AcCircuit& circuit, const std::vector<double>& frequencies_hz);
 
 } // namespace circuitmind

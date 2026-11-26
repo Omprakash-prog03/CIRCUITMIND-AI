@@ -9,13 +9,14 @@ from ..circuit_schema import validate_model
 _REF_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,31}$")
 
 
-def map_circuit_graph_to_mna(model: dict[str, Any], mapping: dict[str, Any], *, allow_capacitors: bool = False) -> dict[str, Any]:
+def map_circuit_graph_to_mna(model: dict[str, Any], mapping: dict[str, Any], *, allow_capacitors: bool = False,
+                             allow_inductors: bool = False) -> dict[str, Any]:
     """Map an existing graph to a two-terminal linear DC netlist without inference.
 
-    Each circuit component must be explicitly mapped to an R/C/V/I element with
+    Each circuit component must be explicitly mapped to an R/C/L/V/I/diode element with
     an explicit quantity and ordered pair of declared pins, or explicitly excluded
-    with a reason. Capacitors require ``allow_capacitors=True`` and an initial voltage;
-    DC MNA callers leave this false. The function never reads descriptions as values.
+    with a reason. Capacitors and inductors require their transient opt-ins and initial
+    conditions. The function never reads descriptions as values.
     """
     topology = validate_model(model)
     if not topology.get("topology_valid"):
@@ -44,9 +45,11 @@ def map_circuit_graph_to_mna(model: dict[str, Any], mapping: dict[str, Any], *, 
     used_net_names = {ground_net}
     elements: list[dict[str, Any]] = []
     resolved_bindings: list[dict[str, Any]] = []
-    value_fields = {"resistor": "resistance", "capacitor": "capacitance",
-                    "voltage_source": "voltage", "current_source": "current"}
-    reference_prefix = {"resistor": "R", "capacitor": "C", "voltage_source": "V", "current_source": "I"}
+    value_fields = {"resistor": "resistance", "capacitor": "capacitance", "inductor": "inductance",
+                    "voltage_source": "voltage", "current_source": "current", "diode": "forward_voltage",
+                    "shockley_diode": "saturation_current"}
+    reference_prefix = {"resistor": "R", "capacitor": "C", "inductor": "L", "diode": "D", "shockley_diode": "D",
+                        "voltage_source": "V", "current_source": "I"}
     for index, binding in enumerate(bindings):
         if not isinstance(binding, dict) or not {"reference", "type", "pins", "value"} <= set(binding):
             raise ValueError(f"bindings[{index}] must contain reference, type, pins, and value")
@@ -54,6 +57,12 @@ def map_circuit_graph_to_mna(model: dict[str, Any], mapping: dict[str, Any], *, 
         expected_binding_fields = {"reference", "type", "pins", "value"}
         if kind == "capacitor" and allow_capacitors:
             expected_binding_fields.add("initial_voltage")
+        if kind == "inductor" and allow_inductors:
+            expected_binding_fields.add("initial_current")
+        if kind == "diode":
+            expected_binding_fields.add("off_resistance")
+        elif kind == "shockley_diode":
+            expected_binding_fields.update({"ideality_factor", "temperature_kelvin"})
         if set(binding) != expected_binding_fields:
             raise ValueError(f"bindings[{index}] has unsupported or missing fields for mapping type {kind!r}")
         if not isinstance(reference, str) or not _REF_RE.fullmatch(reference) or reference not in components:
@@ -63,7 +72,9 @@ def map_circuit_graph_to_mna(model: dict[str, Any], mapping: dict[str, Any], *, 
         if not isinstance(kind, str) or kind not in value_fields:
             raise ValueError(f"{reference} has unsupported mapping type {kind!r}")
         if kind == "capacitor" and not allow_capacitors:
-            raise ValueError(f"{reference} is a capacitor; capacitor mappings require the transient RC workflow")
+            raise ValueError(f"{reference} is a capacitor; capacitor mappings require an explicit transient workflow")
+        if kind == "inductor" and not allow_inductors:
+            raise ValueError(f"{reference} is an inductor; inductor mappings require the transient RLC workflow")
         if reference[0].upper() != reference_prefix[kind]:
             raise ValueError(f"{reference} designator prefix does not match the explicitly selected {kind} type")
         component = components[reference]
@@ -86,9 +97,19 @@ def map_circuit_graph_to_mna(model: dict[str, Any], mapping: dict[str, Any], *, 
             raise ValueError(f"{reference} maps both terminals to the same saved net")
         value_field = value_fields[kind]
         element = {"type": kind, "reference": reference, "nodes": net_nodes}
-        if kind == "capacitor":
+        if kind == "diode":
+            element[value_field] = binding["value"]
+            element["off_resistance"] = binding["off_resistance"]
+        elif kind == "shockley_diode":
+            element[value_field] = binding["value"]
+            element["ideality_factor"] = binding["ideality_factor"]
+            element["temperature_kelvin"] = binding["temperature_kelvin"]
+        elif kind == "capacitor":
             element[value_field] = binding["value"]
             element["initial_voltage"] = binding["initial_voltage"]
+        elif kind == "inductor":
+            element[value_field] = binding["value"]
+            element["initial_current"] = binding["initial_current"]
         elif kind in {"voltage_source", "current_source"} and isinstance(binding["value"], dict) and binding["value"].get("type") == "step":
             element["waveform"] = binding["value"]
         else:
@@ -98,8 +119,15 @@ def map_circuit_graph_to_mna(model: dict[str, Any], mapping: dict[str, Any], *, 
         accounted[reference] = "mapped"
         resolved = {"reference": reference, "type": kind, "pins": list(pins),
                     "nodes": net_nodes, "value": binding["value"]}
-        if kind == "capacitor":
+        if kind == "diode":
+            resolved["off_resistance"] = binding["off_resistance"]
+        elif kind == "shockley_diode":
+            resolved["ideality_factor"] = binding["ideality_factor"]
+            resolved["temperature_kelvin"] = binding["temperature_kelvin"]
+        elif kind == "capacitor":
             resolved["initial_voltage"] = binding["initial_voltage"]
+        elif kind == "inductor":
+            resolved["initial_current"] = binding["initial_current"]
         resolved_bindings.append(resolved)
 
     resolved_exclusions = []

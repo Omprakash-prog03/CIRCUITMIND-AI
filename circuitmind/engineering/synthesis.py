@@ -90,13 +90,36 @@ def synthesize_rc_lowpass(inputs: dict[str, Any]) -> dict[str, Any]:
     c_tol = _percent(inputs["capacitor_tolerance_percent"], "capacitor_tolerance_percent") / 100
     max_error = _percent(inputs["max_cutoff_error_percent"], "max_cutoff_error_percent", allow_zero=False)
 
-    resistance = _nearest_standard(preferred_r, _series_values(series, _MIN_RESISTANCE_OHM, _MAX_RESISTANCE_OHM))
+    resistance_candidates = _series_values(series, _MIN_RESISTANCE_OHM, _MAX_RESISTANCE_OHM)
+    capacitance_candidates = _series_values(series, _MIN_CAPACITANCE_F, _MAX_CAPACITANCE_F)
+    # For each allowed R, the log-nearest E-series C dominates every other C at
+    # that R for both cutoff error and feasibility. This reduces the exhaustive
+    # R×C search to a deterministic scan over every supported R candidate.
+    candidates = []
+    for candidate_r in resistance_candidates:
+        ideal_c = 1.0 / (2.0 * math.pi * cutoff * candidate_r)
+        candidate_c = _nearest_standard(ideal_c, capacitance_candidates)
+        candidate_fc = 1.0 / (2.0 * math.pi * candidate_r * candidate_c)
+        signed_error = 100.0 * (candidate_fc - cutoff) / cutoff
+        log_cutoff_error = abs(math.log(candidate_fc / cutoff))
+        preferred_r_distance = abs(math.log(candidate_r / preferred_r))
+        candidates.append((candidate_r, candidate_c, candidate_fc, signed_error,
+                           log_cutoff_error, preferred_r_distance))
+    feasible_candidates = [candidate for candidate in candidates if abs(candidate[3]) <= max_error]
+    if feasible_candidates:
+        # Treat the requested cutoff bound as hard, then honor preferred R as the
+        # soft objective; use cutoff accuracy and values for stable tie-breaking.
+        selected = min(feasible_candidates, key=lambda item: (item[5], item[4], item[0], item[1]))
+        optimization_status = "preferred-resistance-optimized-within-cutoff-bound"
+    else:
+        # No pair meets the user cutoff limit: return the globally closest available
+        # cutoff candidate as an explicit failure, rather than claiming a pass.
+        selected = min(candidates, key=lambda item: (item[4], item[5], item[0], item[1]))
+        optimization_status = "best-cutoff-effort-no-feasible-pair"
+    resistance, capacitance, achieved, relative_error, cutoff_log_error, preferred_r_distance = selected
+    if abs(relative_error) > 50.0:
+        raise ValueError("No supported E-series resistance/capacitance pair is within the maximum 50 percent cutoff-error range")
     ideal_capacitance = 1.0 / (2.0 * math.pi * cutoff * resistance)
-    if not math.isfinite(ideal_capacitance) or ideal_capacitance < _MIN_CAPACITANCE_F or ideal_capacitance > _MAX_CAPACITANCE_F:
-        raise ValueError("The requested cutoff/preferred resistance requires capacitance outside the supported 1 pF to 100 mF synthesis range")
-    capacitance = _nearest_standard(ideal_capacitance, _series_values(series, _MIN_CAPACITANCE_F, _MAX_CAPACITANCE_F))
-    achieved = 1.0 / (2.0 * math.pi * resistance * capacitance)
-    relative_error = 100.0 * (achieved - cutoff) / cutoff
     tau = resistance * capacitance
     cutoff_min = 1.0 / (2.0 * math.pi * resistance * (1 + r_tol) * capacitance * (1 + c_tol))
     cutoff_max = 1.0 / (2.0 * math.pi * resistance * (1 - r_tol) * capacitance * (1 - c_tol))
@@ -173,7 +196,7 @@ def synthesize_rc_lowpass(inputs: dict[str, Any]) -> dict[str, Any]:
     findings.append("No manufacturer part, footprint, stock availability, source/load impedance, voltage rating, power rating, or datasheet has been checked.")
     return {
         "workflow": "single-pole-rc-low-pass-synthesis",
-        "workflow_version": 1,
+        "workflow_version": 2,
         "design_status": "candidate-meets-nominal-cutoff-constraint" if constraint_met else "candidate-exceeds-nominal-cutoff-constraint",
         "requirements": {"target_cutoff_frequency": _quantity(cutoff, "Hz"), "preferred_resistance": _quantity(preferred_r, "ohm"),
                          "series": series, "resistor_tolerance_percent": 100 * r_tol,
@@ -181,6 +204,13 @@ def synthesize_rc_lowpass(inputs: dict[str, Any]) -> dict[str, Any]:
         "architecture": {"description": "One-pole passive RC low-pass: ideal input source -> series resistor -> output node; capacitor from output to ground.",
                          "transfer_function": "H(s) = 1 / (1 + s R C)",
                          "assumptions": ["ideal zero-impedance source", "no load at VOUT", "lumped linear R and C", "nominal values for nominal response"]},
+        "optimization": {"algorithm": "bounded exhaustive E-series search over every supported resistance and its dominating nearest-log-distance capacitance",
+                         "objective_order": ["meet the user maximum cutoff-error bound when possible", "minimize logarithmic distance from preferred resistance", "minimize logarithmic cutoff error", "stable numeric tie-break"],
+                         "status": optimization_status, "resistance_candidate_count": len(resistance_candidates),
+                         "evaluated_resistance_candidates": len(candidates),
+                         "cutoff_feasible_resistance_count": len(feasible_candidates),
+                         "selected_log_cutoff_error": cutoff_log_error,
+                         "selected_log_preferred_resistance_distance": preferred_r_distance},
         "selected_values": {"resistance": _quantity(resistance, "ohm"), "capacitance": _quantity(capacitance, "F"),
                             "ideal_capacitance_before_series_rounding": _quantity(ideal_capacitance, "F"),
                             "time_constant": _quantity(tau, "s"), "nominal_cutoff_frequency": _quantity(achieved, "Hz"),
