@@ -1,10 +1,10 @@
 # CIRCUITMIND AI
 
-CIRCUITMIND AI is a local engineering workbench for turning electronics requirements and supplied inventories into traceable project data. **Implemented slices:** deterministic intake/feasibility, a versioned circuit graph with a JSON editor, graph validation and revision snapshots; a standalone C++20 core with bounded linear DC MNA and RC backward-Euler simulation; and a deterministic single-pole RC low-pass synthesis/analyze/test workflow that uses the native core. The existing Python DC/transient solvers remain legacy implementations pending migration. Other slices include revision-bound engineering calculations, a gated KiCad XML netlist exporter, read-only symbol audits, source-hashed datasheet text intake, KiCad ERC/DRC adapters, and an ngspice batch adapter for user-imported decks when available.
+CIRCUITMIND AI is a local engineering workbench for turning electronics requirements and supplied inventories into traceable project data. **Implemented slices:** deterministic intake/feasibility, a versioned circuit graph with a JSON editor, graph validation and revision snapshots; a standalone C++20 core with bounded linear DC MNA and RC backward-Euler simulation; and a deterministic single-pole RC low-pass synthesis/analyze/test workflow using the native core. The Python DC MNA and generic RC transient entry points now delegate their numerical solves to C++ while retaining Python validation, graph mapping, and report formatting. Other slices include revision-bound engineering calculations, a gated KiCad XML netlist exporter, read-only symbol audits, source-hashed datasheet text intake, KiCad ERC/DRC adapters, and an ngspice batch adapter for user-imported decks when available.
 
 ## Run
 
-The Python web application requires Python 3.11+ and uses the standard library. Building the native core requires CMake 3.20+ and a C++20 compiler. Build the native C++20 core for the RC synthesis workflow (the app can still start without it, but that endpoint returns HTTP 503 until the core is built):
+The Python web application requires Python 3.11+ and uses the standard library. Building the native core requires CMake 3.20+ and a C++20 compiler. Build the native C++20 core for DC operating-point, RC transient, and RC synthesis endpoints (the app can still start without it, but solver requests return HTTP 503 until the core is built):
 
 ```bash
 cmake -S . -B build -DCIRCUITMIND_BUILD_TESTS=ON
@@ -26,7 +26,7 @@ The server is intended for local use. It does not offer a general shell, arbitra
 - Intake accepts a natural-language project brief, a line-based component inventory, and discrete-logic or ESP32-hybrid direction.
 - The benchmark feasibility check identifies insufficient stock instead of silently replacing supplied parts.
 - Projects persist requirements, parsed BOM, architecture notes, assumptions/calculation examples, a validation ledger, and a ZIP export.
-- The standalone C++20 core (`core/`) provides a bounded dense linear DC MNA solver and fixed-step backward-Euler RC transient solver behind a versioned C ABI. The RC low-pass synthesis workflow uses C++ for its authoritative transient result; the existing Python DC/transient paths are legacy and migration is incomplete. None is nonlinear SPICE validation. Python also provides unit-checked Ohm's law, resistor/capacitor networks, RC time constant, stored energy, a tolerance-aware E6/E12/E24 LED-resistor analysis, a clock timebase budget, and explicit-input clock-divider candidates. Project reports retain hashes; matching a hash is not engineering approval.
+- The standalone C++20 core (`core/`) provides bounded dense linear DC MNA and fixed-step backward-Euler RC transient solving behind a versioned C ABI. Python entry points marshal explicit inputs and preserve report contracts, while numerical solves run in C++; graph mapping and workflow orchestration remain Python-owned. DC supports up to 500 elements, 150 non-ground nodes, and 180 total unknowns; transient supports up to 100 elements, 24 non-ground nodes, 32 unknowns, and 2,000 steps. Neither is nonlinear SPICE validation. Python also provides unit-checked Ohm's law, resistor/capacitor networks, RC time constant, stored energy, a tolerance-aware E6/E12/E24 LED-resistor analysis, a clock timebase budget, and explicit-input clock-divider candidates. Project reports retain hashes; matching a hash is not engineering approval.
 - Circuit-model schema v2 stores component references, symbol IDs, pin metadata, placement coordinates, nets, and pin-to-net terminals.
 - The UI can edit this JSON model, ask the server for graph/schema checks, save revisions, and restore an earlier snapshot.
 - KiCad XML netlist output is generated only when the model has components, consistent declared pins/nets, and caller-supplied symbol IDs. It is not a schematic export.
@@ -48,12 +48,12 @@ The clock benchmark intentionally reports that the sample inventory is insuffici
 ## Architecture
 
 - `core/`: C++20 typed circuit/element model, bounded MNA and RC transient solver, C ABI v1, standalone CLI, and native CTest suite.
-- `circuitmind/`: Python standard-library server, typed graph/workflows, unit validation, ctypes bridge, legacy solver routes, KiCad adapters, persistence/snapshots.
+- `circuitmind/`: Python standard-library server, typed graph/workflows, unit validation, ctypes bridge, native solver adapters, KiCad adapters, persistence/snapshots.
 - `web/`: browser-based local project intake, circuit-model editor, and bounded RC synthesis workflow.
 - `tests/`: Python/API/native-ABI regression tests. Python/native tests compile the C++ shared library to a temporary directory; native CMake tests run separately via CTest. No actual KiCad/ngspice run is claimed.
-- `docs/DEVELOPMENT_PLAN.md`: milestone roadmap and release criteria.
-- `docs/CIRCUIT_ENGINE_ARCHITECTURE.md`: versioned subsystem contracts, C++/Python boundary, current RC synthesis workflow, and migration plan.
-- `docs/CIRCUIT_ENGINE_PROGRESS.md`: inspected repository status, completed/verified work, incomplete capabilities, and milestone gates.
+- `docs/DEVELOPMENT_PLAN.md`: capability inventory and release criteria (not a phased delivery plan).
+- `docs/CIRCUIT_ENGINE_ARCHITECTURE.md`: versioned subsystem contracts, C++/Python boundary, current RC synthesis workflow, and remaining platform scope.
+- `docs/CIRCUIT_ENGINE_PROGRESS.md`: current implementation status, verified checks, and remaining limitations.
 
 Projects live below `CIRCUITMIND_DATA_DIR/projects/<project-id>/`. Tool availability probes report installation/version only; they do not imply a validation operation ran.
 

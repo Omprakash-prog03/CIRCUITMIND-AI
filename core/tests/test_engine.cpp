@@ -97,6 +97,24 @@ void testCAbiRoundTrip() {
                                                                         &samples, &residual, error, sizeof(error));
     assert(short_buffer_status != 0);
     assert(std::string_view(error).find("too small") != std::string_view::npos);
+
+    const cm_element_v1 dc_elements[] = {
+        {static_cast<uint32_t>(ElementKind::VoltageSource), 1, 0, 1.0, 0.0, 0.0, 0.0, 0},
+        {static_cast<uint32_t>(ElementKind::Resistor), 1, 0, 1000.0, 0.0, 0.0, 0.0, 0},
+    };
+    const cm_dc_request_v1 dc_request{1, 2, 0, 2, dc_elements};
+    double dc_nodes[2]{}, dc_volts[2]{}, dc_currents[2]{}, dc_powers[2]{};
+    cm_dc_result_v2 dc_result{};
+    dc_result.node_voltages_v = dc_nodes; dc_result.node_capacity = 2;
+    dc_result.element_voltages_v = dc_volts; dc_result.element_voltage_capacity = 2;
+    dc_result.element_currents_a = dc_currents; dc_result.element_current_capacity = 2;
+    dc_result.element_powers_w = dc_powers; dc_result.element_power_capacity = 2;
+    const int dc_status = cm_engine_solve_dc_v2(&dc_request, &dc_result, error, sizeof(error));
+    assert(dc_status == 0);
+    assert(std::abs(dc_nodes[1] - 1.0) < 1e-12);
+    assert(std::abs(dc_currents[0] + 1e-3) < 1e-12);
+    assert(std::abs(dc_powers[0] + dc_powers[1]) < 1e-12);
+    assert(dc_result.unknown_count == 2);
 }
 
 int main() {

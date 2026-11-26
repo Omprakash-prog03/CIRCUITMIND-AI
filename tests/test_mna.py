@@ -1,5 +1,8 @@
 import unittest
 
+from tests.native_core import ensure_native_core
+ensure_native_core()
+
 from circuitmind.engineering import solve_dc_operating_point
 
 

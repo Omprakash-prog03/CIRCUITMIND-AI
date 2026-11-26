@@ -9,9 +9,12 @@
 
 namespace circuitmind {
 namespace {
-constexpr std::size_t kMaximumElements = 100;
-constexpr std::size_t kMaximumNodesIncludingGround = 25;
-constexpr std::size_t kMaximumUnknowns = 32;
+constexpr std::size_t kMaximumTransientElements = 100;
+constexpr std::size_t kMaximumTransientNodesIncludingGround = 25;
+constexpr std::size_t kMaximumTransientUnknowns = 32;
+constexpr std::size_t kMaximumDcElements = 500;
+constexpr std::size_t kMaximumDcNodesIncludingGround = 151;
+constexpr std::size_t kMaximumDcUnknowns = 180;
 constexpr std::size_t kMaximumSteps = 2000;
 constexpr double kPivotFloor = 1e-12;
 
@@ -44,15 +47,15 @@ double sourceValue(const Element& element, double time_s, bool pre_step) {
         ? element.final_value : element.initial_value;
 }
 
-void validateCircuitShape(const Circuit& circuit) {
-    if (circuit.node_count < 2 || circuit.node_count > kMaximumNodesIncludingGround) {
-        throw SolverError("circuit node_count must include ground and be between 2 and 25");
+void validateCircuitShape(const Circuit& circuit, std::size_t maximum_nodes, std::size_t maximum_elements) {
+    if (circuit.node_count < 2 || circuit.node_count > maximum_nodes) {
+        throw SolverError("circuit node_count is outside the configured bounded range (ground included)");
     }
     if (circuit.ground_index >= circuit.node_count) {
         throw SolverError("ground_index is outside the node range");
     }
-    if (circuit.elements.empty() || circuit.elements.size() > kMaximumElements) {
-        throw SolverError("circuit must contain between 1 and 100 elements");
+    if (circuit.elements.empty() || circuit.elements.size() > maximum_elements) {
+        throw SolverError("circuit element count is outside the configured bounded range");
     }
     bool ground_seen = false;
     for (std::size_t index = 0; index < circuit.elements.size(); ++index) {
@@ -93,7 +96,7 @@ void validateCircuitShape(const Circuit& circuit) {
     }
 }
 
-DcResult solveLinear(const Circuit& circuit, const std::vector<LinearElement>& elements) {
+DcResult solveLinear(const Circuit& circuit, const std::vector<LinearElement>& elements, std::size_t maximum_unknowns) {
     const std::size_t node_unknowns = circuit.node_count - 1;
     std::vector<std::size_t> node_slot(circuit.node_count, std::numeric_limits<std::size_t>::max());
     for (std::size_t node = 0, slot = 0; node < circuit.node_count; ++node) {
@@ -105,8 +108,8 @@ DcResult solveLinear(const Circuit& circuit, const std::vector<LinearElement>& e
         if (elements[index].kind == ElementKind::VoltageSource) voltage_branch[index] = voltage_count++;
     }
     const std::size_t dimension = node_unknowns + voltage_count;
-    if (dimension == 0 || dimension > kMaximumUnknowns) {
-        throw SolverError("MNA system exceeds the 32-unknown limit");
+    if (dimension == 0 || dimension > maximum_unknowns) {
+        throw SolverError("MNA system exceeds the configured unknown-count limit");
     }
     std::vector<std::vector<double>> matrix(dimension, std::vector<double>(dimension, 0.0));
     std::vector<double> rhs(dimension, 0.0);
@@ -157,6 +160,8 @@ DcResult solveLinear(const Circuit& circuit, const std::vector<LinearElement>& e
         rhs[row] /= scale;
         requireFinite(rhs[row], "scaled MNA right-hand side");
     }
+    double minimum_scaled_pivot = std::numeric_limits<double>::infinity();
+    double maximum_scaled_pivot = 0.0;
     for (std::size_t column = 0; column < dimension; ++column) {
         std::size_t pivot_row = column;
         for (std::size_t row = column + 1; row < dimension; ++row) {
@@ -166,6 +171,8 @@ DcResult solveLinear(const Circuit& circuit, const std::vector<LinearElement>& e
         if (!std::isfinite(pivot) || pivot < kPivotFloor) {
             throw SolverError("MNA matrix is singular or numerically ill-conditioned; no result reported");
         }
+        minimum_scaled_pivot = std::min(minimum_scaled_pivot, pivot);
+        maximum_scaled_pivot = std::max(maximum_scaled_pivot, pivot);
         if (pivot_row != column) {
             std::swap(matrix[pivot_row], matrix[column]);
             std::swap(rhs[pivot_row], rhs[column]);
@@ -191,17 +198,58 @@ DcResult solveLinear(const Circuit& circuit, const std::vector<LinearElement>& e
         requireFinite(solution[row], "MNA solution");
     }
     double max_residual = 0.0;
+    double max_kcl_residual = 0.0;
+    double max_voltage_residual = 0.0;
+    double normalized_residual = 0.0;
     for (std::size_t row = 0; row < dimension; ++row) {
         double actual = 0.0;
-        for (std::size_t column = 0; column < dimension; ++column) actual += original_matrix[row][column] * solution[column];
+        double scale = std::max(1e-30, std::abs(original_rhs[row]));
+        for (std::size_t column = 0; column < dimension; ++column) {
+            const double term = original_matrix[row][column] * solution[column];
+            actual += term;
+            scale += std::abs(term);
+        }
         requireFinite(actual, "MNA residual calculation");
-        max_residual = std::max(max_residual, std::abs(actual - original_rhs[row]));
+        const double residual = std::abs(actual - original_rhs[row]);
+        max_residual = std::max(max_residual, residual);
+        normalized_residual = std::max(normalized_residual, residual / scale);
+        if (row < node_unknowns) max_kcl_residual = std::max(max_kcl_residual, residual);
+        else max_voltage_residual = std::max(max_voltage_residual, residual);
     }
     std::vector<double> node_voltages(circuit.node_count, 0.0);
     for (std::size_t node = 0; node < circuit.node_count; ++node) {
         if (node != circuit.ground_index) node_voltages[node] = solution[node_slot[node]];
     }
-    return {std::move(node_voltages), max_residual, dimension};
+    DcResult result;
+    result.node_voltages_v = std::move(node_voltages);
+    result.maximum_equation_residual = max_residual;
+    result.maximum_kcl_residual_a = max_kcl_residual;
+    result.maximum_voltage_source_residual_v = max_voltage_residual;
+    result.normalized_equation_residual = normalized_residual;
+    result.minimum_scaled_pivot = minimum_scaled_pivot;
+    result.maximum_scaled_pivot = maximum_scaled_pivot;
+    result.unknown_count = dimension;
+    result.element_voltages_v.reserve(elements.size());
+    result.element_currents_a.reserve(elements.size());
+    result.element_powers_w.reserve(elements.size());
+    for (std::size_t index = 0; index < elements.size(); ++index) {
+        const auto& element = elements[index];
+        const double voltage = result.node_voltages_v[element.a] - result.node_voltages_v[element.b];
+        double current = 0.0;
+        if (element.kind == ElementKind::Resistor) current = voltage / element.value;
+        else if (element.kind == ElementKind::CurrentSource) current = element.value;
+        else if (element.kind == ElementKind::VoltageSource) current = solution[node_unknowns + voltage_branch[index]];
+        const double power = voltage * current;
+        requireFinite(voltage, "element voltage");
+        requireFinite(current, "element current");
+        requireFinite(power, "element power");
+        result.element_voltages_v.push_back(voltage);
+        result.element_currents_a.push_back(current);
+        result.element_powers_w.push_back(power);
+        result.total_power_balance_w += power;
+        requireFinite(result.total_power_balance_w, "total power balance");
+    }
+    return result;
 }
 
 } // namespace
@@ -211,7 +259,7 @@ const char* engineVersion() noexcept {
 }
 
 DcResult solveDc(const Circuit& circuit) {
-    validateCircuitShape(circuit);
+    validateCircuitShape(circuit, kMaximumDcNodesIncludingGround, kMaximumDcElements);
     std::vector<LinearElement> linear;
     linear.reserve(circuit.elements.size());
     for (const auto& element : circuit.elements) {
@@ -223,11 +271,11 @@ DcResult solveDc(const Circuit& circuit) {
         }
         linear.push_back({element.kind, element.node_a, element.node_b, element.value});
     }
-    return solveLinear(circuit, linear);
+    return solveLinear(circuit, linear, kMaximumDcUnknowns);
 }
 
 TransientResult simulateTransientRc(const Circuit& circuit, const TransientOptions& options) {
-    validateCircuitShape(circuit);
+    validateCircuitShape(circuit, kMaximumTransientNodesIncludingGround, kMaximumTransientElements);
     requireFinite(options.time_step_s, "time step");
     requireFinite(options.stop_time_s, "stop time");
     if (options.time_step_s <= 0.0 || options.stop_time_s <= 0.0) {
@@ -262,7 +310,7 @@ TransientResult simulateTransientRc(const Circuit& circuit, const TransientOptio
     }
     if (capacitor_count == 0) throw SolverError("linear RC transient requires at least one capacitor");
     const std::size_t unknowns = circuit.node_count - 1 + independent_voltage_count + capacitor_count;
-    if (unknowns > kMaximumUnknowns) throw SolverError("transient network exceeds the 32-unknown solve limit");
+    if (unknowns > kMaximumTransientUnknowns) throw SolverError("transient network exceeds the 32-unknown solve limit");
 
     // Establish t=0- from explicit capacitor voltages and pre-step source values.
     std::vector<LinearElement> initial;
@@ -274,7 +322,7 @@ TransientResult simulateTransientRc(const Circuit& circuit, const TransientOptio
             initial.push_back({element.kind, element.node_a, element.node_b, sourceValue(element, 0.0, true)});
         }
     }
-    const auto initial_state = solveLinear(circuit, initial);
+    const auto initial_state = solveLinear(circuit, initial, kMaximumTransientUnknowns);
     std::vector<double> previous_capacitor_voltages;
     previous_capacitor_voltages.reserve(capacitor_count);
     for (const auto& element : circuit.elements) {
@@ -319,7 +367,7 @@ TransientResult simulateTransientRc(const Circuit& circuit, const TransientOptio
                 companion.push_back({element.kind, element.node_a, element.node_b, sourceValue(element, time_s, false)});
             }
         }
-        const auto state = solveLinear(circuit, companion);
+        const auto state = solveLinear(circuit, companion, kMaximumTransientUnknowns);
         capacitor_index = 0;
         for (const auto& element : circuit.elements) {
             if (element.kind == ElementKind::Capacitor) {

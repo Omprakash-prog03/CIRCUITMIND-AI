@@ -1,6 +1,9 @@
 import copy
 import unittest
 
+from tests.native_core import ensure_native_core
+ensure_native_core()
+
 from circuitmind.circuit_schema import new_circuit_model
 from circuitmind.engineering import map_circuit_graph_to_mna, solve_dc_operating_point
 

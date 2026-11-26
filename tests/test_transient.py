@@ -1,6 +1,9 @@
 import math
 import unittest
 
+from tests.native_core import ensure_native_core
+ensure_native_core()
+
 from circuitmind.engineering import simulate_transient_rc
 
 
@@ -70,6 +73,10 @@ class TransientRcTests(unittest.TestCase):
         cases.append({**base, "stop_time": {"value": .00105, "unit": "s"}})
         cases.append({**base, "method": "trapezoidal"})
         cases.append({**base, "elements": [item for item in base["elements"] if item["type"] != "capacitor"]})
+        duplicate_references = step_rc_netlist()
+        duplicate_references["elements"][2]["reference"] = "R1"
+        cases.append(duplicate_references)
+        cases.append({**base, "time_step": {"value": 1e-320, "unit": "s"}, "stop_time": {"value": 1, "unit": "s"}})
         cases.append({**base, "elements": base["elements"] + [{"type": "inductor", "reference": "L1", "nodes": ["OUT", "0"], "inductance": {"value": 1, "unit": "mH"}}]})
         bad_waveform = step_rc_netlist()
         bad_waveform["elements"][0]["waveform"]["step_time"] = {"value": 2, "unit": "s"}

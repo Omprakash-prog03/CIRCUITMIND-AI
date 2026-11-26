@@ -1,46 +1,41 @@
-# Circuit Engine development progress
+# Circuit Engine implementation status
 
 **Status date:** 2026-11-26
 
-**Current delivery:** foundation milestone in progress; not production-ready.
+**Current delivery approach:** integrated bulk implementation, not phased milestone delivery. The current work is bounded native-solver integration, not a claim that the entire platform is complete or production-ready.
 
-## Repository inspection summary
+## Implemented
 
-The inspected checkout is a Python 3.11 standard-library web application with a browser UI, schema-v2 circuit graph, snapshots, Python unit-aware calculations, Python dense MNA and RC backward-Euler solvers, and adapters for KiCad/ngspice. It has project/API regression tests but had no C++ build, native binding, SymPy/AI agent layer, CMake configuration, or C++ tests before this work. Existing functions and adapters are being preserved during migration. The current master workflow and detailed subsystem boundaries are in [`CIRCUIT_ENGINE_ARCHITECTURE.md`](CIRCUIT_ENGINE_ARCHITECTURE.md).
+- Portable CMake/C++20 core with typed `Circuit`, `Element`, solver requests/results, standalone CLI, and CTest coverage.
+- Native dense MNA for linear DC resistor/independent-source circuits (up to 500 elements, 150 non-ground nodes, and 180 total unknowns), and fixed-step linear RC backward-Euler transient analysis (up to 100 elements, 24 non-ground nodes, 32 unknowns, and 2,000 steps). Capacitor initial voltages and one-step independent sources are explicit. Singular, inconsistent, non-finite, and over-limit requests fail closed.
+- Versioned C ABI with stable ABI version 1, DC request v1 and legacy DC result v1, an expanded DC result v2, and transient request/result v1. The expanded DC output includes element voltages, currents, powers, equation/KCL/source residuals, normalized residual, power balance, pivot metrics, and unknown count.
+- Python `ctypes` bridge delegates numerical DC and RC transient computation to C++. The existing Python DC MNA and generic RC transient entry points now adapt/format native results; they no longer contain alternate numerical solver kernels. The graph mapping, unit conversion, validation, orchestration, and report formatting remain Python-owned. Missing native libraries are explicit errors, not silent Python fallback.
+- Typed deterministic single-pole RC synthesis with E-series nominal selection, schema-v2 graph output and electrical-model provenance, nominal/tolerance analysis, graph validation, native transient test, request hashing, and opt-in snapshot-aware graph application.
+- Regression coverage for native ABI bridges, solver behavior, report contracts, graph mapping, synthesis, API, and schema handling. Unsupported functionality and verification boundaries are stated explicitly.
 
-## Completed and verified in this milestone
+## Validation of current working tree
 
-- Added a portable CMake/C++20 core under `core/`, built from typed `Circuit`, `Element`, and solver request/result types.
-- Added bounded dense MNA for linear DC resistor/independent-source circuits and linear RC backward-Euler transient analysis. Capacitors have explicit initial-voltage constraints; independent sources support DC values or one explicit step waveform.
-- Added numerical guardrails: node/element/unknown/step limits, finite-value checks, source/capacitor consistency checks, pivot/singularity rejection, integer timestep grids, and equation residual reporting.
-- Added versioned C ABI v1 with caller-owned buffers, input/output capacity checks, and error translation; Python bridges through `ctypes` and does not silently fall back to a Python solver.
-- Added standalone CLI (`--version`, `--self-test`) and CTest reference tests (voltage divider, RC step response, singular/limit rejections, C ABI round trip).
-- Added a typed, deterministic single-pole RC low-pass synthesis workflow: E-series nominal selection, schema-v2 graph with typed electrical model v1 metadata, nominal/tolerance analysis, graph validation, C++ transient test, report hashing, and opt-in snapshot-aware graph application.
-- Added explicit no-claims for unverified component identity/ratings, free-text AI interpretation, physical schematic/ERC, and ngspice equivalence.
-- Verification completed: CMake configure/build succeeded; CTest passed 1/1 native test executable; CLI self-test passed; Python suite passed **89 tests**; Python compileall, JavaScript syntax check, and `git diff --check` passed.
+The following checks were run after the latest native integration edits:
 
-## Incomplete
+- `python -m unittest discover -s tests -q` — **89 tests passed**.
+- `cmake --build build --parallel 2` — passed.
+- `ctest --test-dir build --output-on-failure` — **1/1 native test passed**.
+- `build/core/circuitmind_engine_cli --self-test` — passed; 101 RC samples, Vout(5τ) `0.992395510002 V`, max equation residual `4.33680868994e-19`.
+- `python -m compileall -q circuitmind tests` — passed.
+- `node --check web/app.js` — passed.
+- `git diff --check` — passed.
 
-- Existing Python DC MNA and generic transient implementations are still callable legacy paths. The new synthesis workflow uses the C++ transient solver, but the whole platform is not yet C++-authoritative.
-- Native solver uses bounded dense matrices (maximum 32 MNA unknowns); sparse factorization, conditioning estimates beyond scaled pivot rejection, controlled sources, inductors, nonlinear devices, adaptive integration, and AC analysis are not implemented.
-- The C++ core consumes a normalized typed circuit snapshot through C ABI; it does not yet own the full schema-v2 graph, hierarchical sheets, power domains, or electrical pin compatibility rules.
-- Component catalogue/datasheet intelligence, SymPy derivations, requirement-to-topology AI, optimization, digital/mixed-signal engines, and autonomous repair are not implemented.
-- Python binding has transient integration for the first workflow; DC C ABI exists but is not yet wrapped or used by the existing DC API.
-- No native install/package target, Windows build, CI workflow, performance benchmark suite, ABI compatibility matrix, thread-safe job queue, or cancellation facility yet.
+These are repository tests and bounded reference checks, not hardware verification, formal validation, SPICE equivalence, or proof of production readiness.
 
-## Blocked / environmental
+## Remaining scope and limitations
 
-- No trusted manufacturer libraries/datasheet model corpus is configured, so component identity and model qualification cannot be claimed.
-- This environment has g++ 12.2.0. CMake was installed into a temporary local virtual environment for validation; no runtime Python package dependency was added. KiCad/ngspice validation claims remain limited to the existing documented adapters and actual installed-tool availability.
+- C++ core accepts a normalized, indexed circuit snapshot; the canonical schema-v2 project graph, topology mapping, and report orchestration are still Python-managed.
+- Dense matrix solving is intentionally bounded. Sparse factorization, controlled sources, inductors, nonlinear devices, adaptive integration, AC analysis, and digital/mixed-signal simulation are not implemented.
+- Component catalogue/datasheet qualification, free-text requirement interpretation, symbolic/optimization workflows, and autonomous repair are not implemented. No values, models, pinouts, or provenance are silently inferred.
+- No native install/package target, verified Windows build, CI workflow, benchmark suite, ABI compatibility matrix, cancellation/job queue, or comprehensive security review is in place.
+- No vendor qualification, physical schematic verification, hardware testing, manufacturing checks, nonlinear/SPICE equivalence, or production-readiness claim is made.
 
-## Migration plan and gates
+## Environment notes
 
-1. **Core/API foundation — in progress.** Keep C++ independent and C ABI versioned; add unit, integration, and numerical reference tests for every exposed behavior.
-2. **Migrate legacy solvers.** Port existing Python graph-bound DC and transient endpoints to native C++, retain old report contracts, compare parity on all current regression fixtures, then remove Python numerical kernels only after tests establish parity.
-3. **Canonical model evolution.** Introduce a deliberate schema migration for richer typed graph fields, pin electrical types/limits, datasheet/model provenance, hierarchical nets, and simulation configuration. No implicit name-based model lookup.
-4. **Analog capability expansion.** Add AC/DC sweep and actual ngspice backend integration with generated deck, executable/version capture, parsing, raw data retention, and reference comparisons.
-5. **Digital/mixed-signal.** Add bounded discrete-event logic simulation and explicit interface models while retaining one project graph and report identity.
-6. **Python engineering intelligence.** Add typed requirements/questions, symbolic calculations, candidate generation and optimization only when component/source evidence and solver interfaces are defined.
-7. **Production hardening.** Cross-platform builds, ABI/install tests, sparse solver evaluation, deterministic benchmark circuits, resource limits, cancellation, security review, CI and reproducible packaging.
-
-No “production-grade,” “fully autonomous,” “SPICE-equivalent,” or “verified hardware” status should be used until the corresponding gates have passed with retained evidence.
+- CMake was installed into a temporary local virtual environment for validation; no runtime Python dependency was added.
+- KiCad/ngspice and trusted manufacturer model corpora are not configured for this work. No external tool execution or datasheet qualification is implied by the native-core tests.

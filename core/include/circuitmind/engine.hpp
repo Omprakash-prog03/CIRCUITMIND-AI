@@ -36,7 +36,16 @@ struct Circuit {
 
 struct DcResult {
     std::vector<double> node_voltages_v; // Includes ground at ground_index.
+    std::vector<double> element_voltages_v; // Circuit element order.
+    std::vector<double> element_currents_a; // Positive node_a -> node_b.
+    std::vector<double> element_powers_w; // Positive absorbed, circuit element order.
     double maximum_equation_residual{};
+    double maximum_kcl_residual_a{};
+    double maximum_voltage_source_residual_v{};
+    double normalized_equation_residual{};
+    double total_power_balance_w{};
+    double minimum_scaled_pivot{};
+    double maximum_scaled_pivot{};
     std::size_t unknown_count{};
 };
 
