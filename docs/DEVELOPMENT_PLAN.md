@@ -17,12 +17,12 @@ The repository began as a README-only shell. Implement in vertical slices; each 
 - KiCad legacy XML netlist generation gated on explicit symbol IDs and consistent graph/pin declarations; no static image is passed off as a schematic.
 - Symbol library resolution against actual installed libraries, pinout provenance, visual schematic editor, and KiCad CLI/ERC execution remain unimplemented. This environment has no `kicad-cli`; generated netlist bytes are not CLI-validated.
 
-## Milestone 3 — Engineering integrations (KiCad ERC slice implemented; others pending)
+## Milestone 3 — Engineering integrations (KiCad ERC + ngspice adapters implemented; others pending)
 
-- Read-only version probes remain separate from operations. A trusted local `kicad-cli sch erc` adapter is now available for a user-imported `.kicad_sch` file, with timeout, fixed argv/no shell, restricted child environment, captured output, unique reports, append-only run log, exit status, and explicit ERC-message parsing.
-- Imported schematics are size-limited, immutable via API, and not called validated until the real CLI operation runs. A zero process exit without a recognized zero-message summary is reported as unparsed, not clean.
-- This is not an OS/container sandbox; do not use it on untrusted project files. Resource limits beyond a wall-clock timeout and strong process isolation remain future work.
-- ngspice, PlatformIO, Arduino CLI, firmware compilation, KiCad DRC, and hardened sandboxing remain unimplemented. Missing tools report unavailable; a version probe is not a test result.
+- Read-only version probes remain separate from operations. The `kicad-cli sch erc` adapter accepts a user-imported `.kicad_sch`; the ngspice adapter accepts a restricted batch deck and runs `ngspice -b -r ...`.
+- Both operations use fixed argv/no shell, timeouts, restricted child environment, bounded captured logs, source uploads with confirmed replacement archiving, unique reports, an append-only run log, and evidence-based outcome interpretation. SPICE control/file-execution directives are rejected before invocation; raw result downloads are supported with a 64 MB post-run cap.
+- These are not OS/container sandboxes; do not run against untrusted files. CPU/memory/filesystem quotas and stronger process isolation remain future work. Input filtering cannot prove parser safety.
+- PlatformIO, Arduino CLI, firmware compilation, KiCad DRC, real tool execution in this environment, and hardened sandboxing remain unimplemented/unavailable. Tool probes are not validation results.
 
 ## Milestone 4 — Datasheets, component library, calculations
 

@@ -4,7 +4,90 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from circuitmind.integrations import run_kicad_erc
+from circuitmind.integrations import run_kicad_erc, run_ngspice
+from circuitmind.spice import validate_spice_deck
+
+
+class SpiceDeckValidationTests(unittest.TestCase):
+    def test_conventional_transient_deck_is_accepted(self):
+        deck = """RC step response
+V1 in 0 PULSE(0 5 0 1n 1n 1m 2m)
+R1 in out 1k
+C1 out 0 1u
+.tran 1u 5m
+.end
+"""
+        result = validate_spice_deck(deck)
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["supported_analyses"], [".tran"])
+
+    def test_control_file_access_unknown_directive_and_shell_escape_are_rejected(self):
+        for line in (".control\n shell echo unsafe\n.endc", ".include /tmp/model.lib", ".mystery x", "R1 a 0 1k ! unsafe"):
+            with self.subTest(line=line):
+                deck = f"Unsafe test\n{line}\n.tran 1u 1m\n.end\n"
+                result = validate_spice_deck(deck)
+                self.assertFalse(result["accepted"])
+                self.assertTrue(result["errors"])
+
+
+class NgspiceIntegrationTests(unittest.TestCase):
+    DECK = """RC step response
+V1 in 0 PULSE(0 5 0 1n 1n 1m 2m)
+R1 in out 1k
+C1 out 0 1u
+.tran 1u 5m
+.end
+"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.project = Path(self.temp.name) / "project"
+        self.project.mkdir()
+        (self.project / "user_source.cir").write_text(self.DECK, "utf-8")
+        self.bin = Path(self.temp.name) / "bin"
+        self.bin.mkdir()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def fake_ngspice(self, output="No. of Data Rows : 101\n", exit_code=0, sleep_seconds=0):
+        executable = self.bin / "ngspice"
+        script = f'''#!{os.sys.executable}
+import pathlib, sys, time
+if {sleep_seconds!r}: time.sleep({sleep_seconds!r})
+pathlib.Path(sys.argv[3]).write_bytes(b"raw-data")
+print({output!r})
+sys.exit({exit_code})
+'''
+        executable.write_text(script, "utf-8")
+        executable.chmod(0o755)
+        return executable
+
+    def test_batch_adapter_captures_raw_and_requires_data_rows(self):
+        self.fake_ngspice()
+        with patch.dict(os.environ, {"PATH": str(self.bin)}):
+            result = run_ngspice(self.project)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["data_rows"], 101)
+        self.assertEqual((self.project / result["raw_file"]).read_bytes(), b"raw-data")
+
+    def test_missing_tool_timeout_and_error_outputs_are_not_success(self):
+        with patch.dict(os.environ, {"PATH": str(self.bin)}):
+            self.assertEqual(run_ngspice(self.project)["status"], "unavailable")
+        self.fake_ngspice(sleep_seconds=.2)
+        with patch.dict(os.environ, {"PATH": str(self.bin)}):
+            timeout = run_ngspice(self.project, timeout_seconds=.02)
+        self.assertEqual(timeout["status"], "timeout")
+        self.fake_ngspice("Error: singular matrix\nNo. of Data Rows : 0", exit_code=0)
+        with patch.dict(os.environ, {"PATH": str(self.bin)}):
+            failed = run_ngspice(self.project)
+        self.assertEqual(failed["status"], "failed")
+
+    def test_unsafe_deck_is_rejected_before_invoking_tool(self):
+        (self.project / "user_source.cir").write_text("unsafe\n.control\n shell echo bad\n.endc\n.tran 1u 1m\n.end\n", "utf-8")
+        with patch.dict(os.environ, {"PATH": str(self.bin)}):
+            result = run_ngspice(self.project)
+        self.assertEqual(result["status"], "rejected")
 
 
 class KiCadIntegrationTests(unittest.TestCase):

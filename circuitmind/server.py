@@ -6,6 +6,7 @@ import json
 import mimetypes
 import os
 import threading
+import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -13,7 +14,8 @@ from urllib.parse import unquote, urlparse
 
 from . import __version__
 from .circuit_schema import export_kicad_netlist, migrate_model, validate_model
-from .integrations import discover_integrations, run_kicad_erc
+from .integrations import discover_integrations, run_kicad_erc, run_ngspice
+from .spice import validate_spice_deck
 from .models import ProjectInput
 from .project_store import list_snapshots, load_circuit, restore_snapshot, save_circuit
 from .workflow import analyze, make_zip
@@ -114,7 +116,19 @@ class Handler(BaseHTTPRequestHandler):
             if not _valid_id(project_id) or filename not in _allowed_artifacts(project_id):
                 return self._json(404, {"error": "Artifact not found"})
             payload = (DATA_DIR / "projects" / project_id / filename).read_bytes()
-            return self._json(200, {"name": filename, "content": payload.decode("utf-8")})
+            if filename.endswith(".raw"):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            try:
+                text = payload.decode("utf-8")
+            except UnicodeDecodeError:
+                return self._json(415, {"error": "Artifact is binary; use its download link"})
+            return self._json(200, {"name": filename, "content": text})
         return self._static(parsed.path)
 
     def _static(self, url_path: str) -> None:
@@ -140,6 +154,24 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         parts = path.strip("/").split("/")
+        if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["integrations", "ngspice"]:
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            with _project_tool_lock(project_id):
+                result = run_ngspice(folder)
+            with _CIRCUIT_API_LOCK:
+                _append_tool_run(folder, result)
+                _atomic_bytes(folder / "ngspice_result.json", (json.dumps(result, indent=2, ensure_ascii=False) + "\n").encode())
+                validation_path = folder / "validation_report.json"
+                validation = json.loads(validation_path.read_text("utf-8")) if validation_path.exists() else {"checks": {}, "findings": []}
+                validation.setdefault("checks", {})["simulation"] = f"ngspice status: {result.get('status', 'not-run')}"
+                _atomic_bytes(validation_path, (json.dumps(validation, indent=2, ensure_ascii=False) + "\n").encode())
+                _update_project_record(folder, validation)
+            return self._json(200, result)
         if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["integrations", "kicad-erc"]:
             project_id = parts[2]
             if not _valid_id(project_id):
@@ -228,8 +260,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PUT(self) -> None:
         parts = urlparse(self.path).path.strip("/").split("/")
-        if len(parts) == 4 and parts[:2] == ["api", "projects"] and parts[3] == "schematic":
+        if len(parts) == 4 and parts[:2] == ["api", "projects"] and parts[3] in {"schematic", "simulation-deck"}:
             project_id = parts[2]
+            is_schematic = parts[3] == "schematic"
             if not _valid_id(project_id):
                 return self._json(400, {"error": "Invalid project id"})
             folder = DATA_DIR / "projects" / project_id
@@ -239,28 +272,48 @@ class Handler(BaseHTTPRequestHandler):
                 payload = self._read_payload(MAX_SCHEMATIC_BODY)
                 content = payload.get("content")
                 if not isinstance(content, str):
-                    raise ValueError("Schematic upload requires text field 'content'")
+                    raise ValueError("Source upload requires text field 'content'")
                 raw = content.encode("utf-8")
                 if len(raw) > MAX_SCHEMATIC_FILE:
-                    return self._json(413, {"error": "Schematic exceeds the 12 MB file limit"})
-                if not content.lstrip("\ufeff \t\r\n").startswith("(kicad_sch"):
-                    return self._json(422, {"error": "Expected a KiCad S-expression schematic beginning with (kicad_sch"})
-                target = folder / "user_source.kicad_sch"
+                    return self._json(413, {"error": "Source file exceeds the 12 MB limit"})
+                if is_schematic:
+                    if not content.lstrip("\ufeff \t\r\n").startswith("(kicad_sch"):
+                        return self._json(422, {"error": "Expected a KiCad S-expression schematic beginning with (kicad_sch"})
+                    source_name, import_report_name = "user_source.kicad_sch", "schematic_import.json"
+                    import_status = "attached; not parsed or electrically validated"
+                    static_report = None
+                else:
+                    static_report = validate_spice_deck(content)
+                    if not static_report["accepted"]:
+                        return self._json(422, {"error": "SPICE deck rejected by the batch-only directive allowlist", "deck_validation": static_report})
+                    source_name, import_report_name = "user_source.cir", "simulation_deck_import.json"
+                    import_status = "attached; static directive checks passed; not simulated"
+                target = folder / source_name
                 with _project_tool_lock(project_id):
+                    previous_file = None
                     if target.exists():
-                        return self._json(409, {"error": "A source schematic is already attached; overwrite is blocked to protect the imported original."})
+                        if payload.get("replace") is not True:
+                            return self._json(409, {"error": "A source file is already attached. Confirm replacement to archive the current source before updating it."})
+                        previous = target.read_bytes()
+                        previous_hash = hashlib.sha256(previous).hexdigest()
+                        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                        previous_file = f"{target.stem}.previous-{stamp}-{previous_hash[:8]}-{uuid.uuid4().hex[:6]}{target.suffix}"
+                        _atomic_bytes(folder / previous_file, previous)
                     _atomic_bytes(target, raw)
-                    imported = {"status": "attached; not parsed or electrically validated", "file": target.name,
-                                "size_bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
-                    _atomic_bytes(folder / "schematic_import.json", (json.dumps(imported, indent=2, ensure_ascii=False) + "\n").encode())
+                    imported = {"status": import_status, "file": target.name,
+                                "size_bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+                                "previous_file": previous_file}
+                    if static_report is not None:
+                        imported["deck_validation"] = static_report
+                    _atomic_bytes(folder / import_report_name, (json.dumps(imported, indent=2, ensure_ascii=False) + "\n").encode())
                     _update_project_record(folder)
                 return self._json(201, imported)
             except RequestTooLarge as exc:
                 return self._json(413, {"error": str(exc)})
-            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
                 return self._json(400, {"error": str(exc)})
             except OSError as exc:
-                return self._json(500, {"error": f"Unable to attach schematic: {exc}"})
+                return self._json(500, {"error": f"Unable to attach source file: {exc}"})
         if len(parts) != 4 or parts[:2] != ["api", "projects"] or parts[3] != "circuit":
             return self._json(404, {"error": "Not found"})
         project_id = parts[2]

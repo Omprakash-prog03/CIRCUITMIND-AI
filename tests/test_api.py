@@ -93,11 +93,14 @@ class CircuitApiTests(unittest.TestCase):
     def test_schematic_import_is_immutable_and_erc_unavailability_is_recorded(self):
         _, created = self.call("/api/projects", {"name": "Existing KiCad", "description": "Continue schematic", "inventory": "", "architecture": "discrete"}, "POST")
         project_id = created["project_id"]
-        code, imported = self.call(f"/api/projects/{project_id}/schematic", {"content": "(kicad_sch (version 20250101))\\n"}, "PUT")
+        code, imported = self.call(f"/api/projects/{project_id}/schematic", {"content": "(kicad_sch (version 20250101))\n"}, "PUT")
         self.assertEqual(code, 201)
         self.assertEqual(imported["status"], "attached; not parsed or electrically validated")
         code, duplicate = self.call(f"/api/projects/{project_id}/schematic", {"content": "(kicad_sch)"}, "PUT")
         self.assertEqual(code, 409)
+        code, replaced = self.call(f"/api/projects/{project_id}/schematic", {"content": "(kicad_sch (version 20250101))\\n", "replace": True}, "PUT")
+        self.assertEqual(code, 201)
+        self.assertTrue(replaced["previous_file"].startswith("user_source.previous-"))
         with patch.dict(os.environ, {"PATH": str(Path(self.temp.name) / "empty-path")}):
             code, result = self.call(f"/api/projects/{project_id}/integrations/kicad-erc", method="POST")
         self.assertEqual(code, 200)
@@ -108,6 +111,35 @@ class CircuitApiTests(unittest.TestCase):
         code, artifact = self.call(f"/api/projects/{project_id}/artifact/user_source.kicad_sch")
         self.assertEqual(code, 200)
         self.assertIn("kicad_sch", artifact["content"])
+
+    def test_spice_deck_import_requires_static_allowlist_and_simulation_is_logged(self):
+        _, created = self.call("/api/projects", {"name": "SPICE API", "description": "RC transient test", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        unsafe = "unsafe\n.control\nshell echo bad\n.endc\n.tran 1u 1m\n.end\n"
+        code, rejected = self.call(f"/api/projects/{project_id}/simulation-deck", {"content": unsafe}, "PUT")
+        self.assertEqual(code, 422)
+        self.assertIn("directive allowlist", rejected["error"])
+        deck = "RC transient test\nV1 in 0 5\nR1 in out 1k\nC1 out 0 1u\n.tran 1u 5m\n.end\n"
+        code, imported = self.call(f"/api/projects/{project_id}/simulation-deck", {"content": deck}, "PUT")
+        self.assertEqual(code, 201)
+        self.assertIn("static directive checks", imported["status"])
+        code, duplicate = self.call(f"/api/projects/{project_id}/simulation-deck", {"content": deck}, "PUT")
+        self.assertEqual(code, 409)
+        code, replaced = self.call(f"/api/projects/{project_id}/simulation-deck", {"content": deck, "replace": True}, "PUT")
+        self.assertEqual(code, 201)
+        self.assertTrue(replaced["previous_file"].startswith("user_source.previous-"))
+        with patch.dict(os.environ, {"PATH": str(Path(self.temp.name) / "empty-path")}):
+            code, result = self.call(f"/api/projects/{project_id}/integrations/ngspice", method="POST")
+        self.assertEqual(code, 200)
+        self.assertEqual(result["status"], "unavailable")
+        raw_fixture = app_server.DATA_DIR / "projects" / project_id / "ngspice_fixture.raw"
+        raw_fixture.write_bytes(bytes.fromhex("726177006279746573"))
+        code, downloaded = self.call(f"/api/projects/{project_id}/artifact/{raw_fixture.name}")
+        self.assertEqual(code, 200)
+        self.assertEqual(downloaded, bytes.fromhex("726177006279746573"))
+        code, log = self.call(f"/api/projects/{project_id}/artifact/tool_runs.jsonl")
+        self.assertEqual(code, 200)
+        self.assertIn("ngspice batch simulation", log["content"])
 
     def test_invalid_model_is_rejected_without_snapshot(self):
         _, created = self.call("/api/projects", {"name": "API clock", "description": "Clock", "inventory": "", "architecture": "discrete"}, "POST")

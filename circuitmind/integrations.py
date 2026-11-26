@@ -13,9 +13,12 @@ import subprocess
 import tempfile
 import threading
 import uuid
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from .spice import validate_spice_deck
 
 
 _TOOLS = {
@@ -170,3 +173,86 @@ def _as_text(value: str | bytes | None) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return value or ""
+
+
+def run_ngspice(project_dir: Path, timeout_seconds: float = 60.0) -> dict[str, Any]:
+    """Execute an imported, batch-only netlist through local ngspice (not a sandbox)."""
+    project_dir = project_dir.resolve()
+    started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+    deck_path = (project_dir / "user_source.cir").resolve()
+    if deck_path.parent != project_dir or not deck_path.is_file():
+        return {"tool": "ngspice batch simulation", "run_id": run_id, "started_at": started_at,
+                "status": "not-run", "reason": "No imported user_source.cir exists."}
+    if deck_path.stat().st_size > 12_000_000:
+        return {"tool": "ngspice batch simulation", "run_id": run_id, "started_at": started_at,
+                "status": "not-run", "reason": "SPICE deck exceeds 12 MB limit."}
+    try:
+        deck = deck_path.read_text("utf-8")
+    except (OSError, UnicodeError) as exc:
+        return {"tool": "ngspice batch simulation", "run_id": run_id, "started_at": started_at,
+                "status": "not-run", "reason": f"SPICE deck could not be read: {exc}"}
+    static_check = validate_spice_deck(deck)
+    deck_sha256 = hashlib.sha256(deck.encode("utf-8")).hexdigest()
+    if not static_check["accepted"]:
+        return {"tool": "ngspice batch simulation", "run_id": run_id, "started_at": started_at,
+                "status": "rejected", "reason": "Deck did not pass the batch-only directive allowlist.",
+                "deck_validation": static_check, "input_sha256": deck_sha256}
+    executable = shutil.which("ngspice")
+    if not executable:
+        return {"tool": "ngspice batch simulation", "run_id": run_id, "started_at": started_at,
+                "status": "unavailable", "reason": "ngspice was not found on PATH; no simulation was run.",
+                "deck_validation": static_check, "input_sha256": deck_sha256}
+    executable = str(Path(executable).resolve())
+    raw_path = project_dir / f"ngspice_{run_id}.raw"
+    log_path = project_dir / f"ngspice_{run_id}.log"
+    with tempfile.TemporaryDirectory(prefix="circuitmind-spice-", dir=project_dir) as temp_dir:
+        sandbox = Path(temp_dir)
+        home = sandbox / "home"
+        home.mkdir()
+        env = {"PATH": os.environ.get("PATH", ""), "HOME": str(home), "TMP": str(sandbox),
+               "TEMP": str(sandbox), "TMPDIR": str(sandbox)}
+        command = [executable, "-b", "-r", str(raw_path), str(deck_path)]
+        try:
+            exit_code, stdout, stderr = _run_bounded(command, sandbox, env, timeout_seconds)
+            output = (stdout + "\n" + stderr)[-128_000:]
+            log_path.write_text(output, encoding="utf-8")
+            rows_match = re.search(r"(?i)no\.\s+of\s+data\s+rows\s*:\s*(\d+)", output)
+            error_seen = re.search(r"(?im)^\s*(?:fatal\s+)?error\b|simulation interrupted", output)
+            rows = int(rows_match.group(1)) if rows_match else None
+            raw_size = raw_path.stat().st_size if raw_path.is_file() else 0
+            if raw_size > 64_000_000:
+                raw_path.unlink(missing_ok=True)
+                return {"tool": "ngspice batch simulation", "run_id": run_id, "started_at": started_at,
+                        "status": "failed-result-too-large", "exit_code": exit_code,
+                        "reason": "Raw result exceeded 64 MB and was removed.", "log_file": log_path.name,
+                        "stdout": stdout, "stderr": stderr, "deck_validation": static_check, "input_sha256": deck_sha256}
+            if exit_code != 0 or error_seen:
+                status = "failed"
+            elif rows is not None and rows > 0:
+                status = "completed"
+            else:
+                status = "completed-unparsed"
+            return {"tool": "ngspice batch simulation", "run_id": run_id, "started_at": started_at,
+                    "status": status, "exit_code": exit_code, "data_rows": rows,
+                    "command": command, "raw_file": raw_path.name if raw_size else None,
+                    "raw_size_bytes": raw_size, "log_file": log_path.name,
+                    "stdout": stdout, "stderr": stderr, "deck_validation": static_check,
+                    "input_sha256": deck_sha256,
+                    "interpretation": "A nonzero exit or explicit error fails; zero exit is completed only when ngspice reports a positive data-row count."}
+        except subprocess.TimeoutExpired as exc:
+            stdout, stderr = _as_text(exc.stdout)[-64_000:], _as_text(exc.stderr)[-64_000:]
+            output = (stdout + "\n" + stderr)[-128_000:]
+            log_path.write_text(output, encoding="utf-8")
+            raw_size = raw_path.stat().st_size if raw_path.is_file() else 0
+            if raw_size > 64_000_000:
+                raw_path.unlink(missing_ok=True)
+                raw_size = 0
+            return {"tool": "ngspice batch simulation", "run_id": run_id, "started_at": started_at,
+                    "status": "timeout", "exit_code": None, "reason": f"Simulation exceeded {timeout_seconds:g} seconds.",
+                    "log_file": log_path.name, "raw_file": raw_path.name if raw_size else None,
+                    "raw_size_bytes": raw_size, "stdout": stdout, "stderr": stderr, "deck_validation": static_check, "input_sha256": deck_sha256}
+        except OSError as exc:
+            return {"tool": "ngspice batch simulation", "run_id": run_id, "started_at": started_at,
+                    "status": "failed-to-start", "exit_code": None, "reason": f"Unable to start ngspice: {exc}",
+                    "deck_validation": static_check, "input_sha256": deck_sha256}

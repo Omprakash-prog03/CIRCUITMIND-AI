@@ -46,8 +46,10 @@ function renderResult(project) {
   const checks = project.validation?.checks || {};
   const inventoryRows = (project.inventory || []).map((item) => `<tr><td>${escapeHtml(item.name)}</td><td>${escapeHtml(item.quantity ?? 'unspecified')}</td><td>Unverified</td></tr>`).join('');
   const statusLines = Object.entries(checks).map(([name, status]) => `<div class="validation-line"><span>${escapeHtml(name.replaceAll('_',' '))}</span><span>${escapeHtml(status)}</span></div>`).join('');
-  const artifactButtons = (project.artifacts || []).map((name) => `<button class="artifact-button" data-artifact="${escapeHtml(name)}">↗ &nbsp;${escapeHtml(name)}</button>`).join('');
-  $('#view-result').innerHTML = `<div class="result-top"><div class="eyebrow"><span class="eyebrow-line"></span> ENGINEERING INTAKE COMPLETE</div><h1>${escapeHtml(project.name)}</h1><p>${escapeHtml(project.architecture)} architecture · Created ${escapeHtml(new Date(project.created_at).toLocaleString())}</p><div class="result-actions"><a class="primary-button" href="/api/projects/${encodeURIComponent(project.project_id)}/export"><span>Download project ZIP</span><span class="button-arrow">↓</span></a><button class="small-button" id="edit-circuit">Edit circuit model</button><button class="small-button" id="import-schematic">Import KiCad schematic</button><button class="small-button" id="run-kicad-erc">Run KiCad ERC</button><button class="small-button" id="show-snapshots">Snapshots</button><button class="small-button" id="back-to-brief">← New analysis</button></div></div>
+  const artifactButtons = (project.artifacts || []).map((name) => name.endsWith('.raw')
+    ? `<a class="artifact-button" href="/api/projects/${encodeURIComponent(project.project_id)}/artifact/${encodeURIComponent(name)}" download>↓ &nbsp;Download ${escapeHtml(name)}</a>`
+    : `<button class="artifact-button" data-artifact="${escapeHtml(name)}">↗ &nbsp;${escapeHtml(name)}</button>`).join('');
+  $('#view-result').innerHTML = `<div class="result-top"><div class="eyebrow"><span class="eyebrow-line"></span> ENGINEERING INTAKE COMPLETE</div><h1>${escapeHtml(project.name)}</h1><p>${escapeHtml(project.architecture)} architecture · Created ${escapeHtml(new Date(project.created_at).toLocaleString())}</p><div class="result-actions"><a class="primary-button" href="/api/projects/${encodeURIComponent(project.project_id)}/export"><span>Download project ZIP</span><span class="button-arrow">↓</span></a><button class="small-button" id="edit-circuit">Edit circuit model</button><button class="small-button" id="import-schematic">Import KiCad schematic</button><button class="small-button" id="run-kicad-erc">Run KiCad ERC</button><button class="small-button" id="import-spice">Import SPICE deck</button><button class="small-button" id="run-ngspice">Run ngspice</button><button class="small-button" id="show-snapshots">Snapshots</button><button class="small-button" id="back-to-brief">← New analysis</button></div></div>
   <div class="status-banner">⚠ &nbsp; Incomplete — this is requirements and feasibility analysis, not a completed electrical design.</div>
   <div class="result-grid"><div><section class="result-panel"><h2>Feasibility findings <span class="optional">${findings.length} ITEMS</span></h2>${findings.map((finding) => `<div class="finding"><span class="finding-icon">!</span><span>${escapeHtml(finding)}</span></div>`).join('')}</section>
   <section class="result-panel"><h2>Supplied component inventory</h2>${inventoryRows ? `<table class="inventory-table"><thead><tr><th>PART / DESCRIPTION</th><th>QTY</th><th>VERIFICATION</th></tr></thead><tbody>${inventoryRows}</tbody></table>` : '<div class="empty-state">No inventory provided.</div>'}</section></div>
@@ -57,6 +59,8 @@ function renderResult(project) {
   $('#edit-circuit').addEventListener('click', openCircuitEditor);
   $('#import-schematic').addEventListener('click', () => $('#schematic-file').click());
   $('#run-kicad-erc').addEventListener('click', runKiCadErc);
+  $('#import-spice').addEventListener('click', () => $('#spice-file').click());
+  $('#run-ngspice').addEventListener('click', runNgspice);
   $('#show-snapshots').addEventListener('click', showSnapshots);
   showView('result');
 }
@@ -120,17 +124,47 @@ async function showSnapshots() {
   } catch (error) { toast(error.message); }
 }
 
+async function uploadSource(url, content, label) {
+  let response = await fetch(url, {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({content})});
+  let result = await response.json();
+  if (response.status === 409 && window.confirm(`${label} already exists. Archive the current version and replace it?`)) {
+    response = await fetch(url, {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({content, replace:true})});
+    result = await response.json();
+  }
+  if (!response.ok) throw new Error(result.deck_validation?.errors?.join(' · ') || result.error || `Upload failed (${response.status})`);
+  return result;
+}
 async function importSchematicFile(file) {
   if (!file) return;
   if (!file.name.toLowerCase().endsWith('.kicad_sch')) { toast('Choose a .kicad_sch file.'); return; }
   if (file.size > 12_000_000) { toast('Schematic exceeds the 12 MB limit.'); return; }
   try {
     const content = await file.text();
-    const response = await fetch(`/api/projects/${encodeURIComponent(currentProject.project_id)}/schematic`, {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({content})});
-    const result = await response.json();
-    if (!response.ok) throw new Error(result.error || `Import failed (${response.status})`);
+    await uploadSource(`/api/projects/${encodeURIComponent(currentProject.project_id)}/schematic`, content, 'A schematic');
     await refreshProject(currentProject.project_id);
     toast('Schematic attached. It has not been parsed or checked yet.');
+  } catch (error) { toast(error.message); }
+}
+async function importSpiceFile(file) {
+  if (!file) return;
+  if (!/\.(cir|sp|ckt)$/i.test(file.name)) { toast('Choose a .cir, .sp, or .ckt netlist.'); return; }
+  if (file.size > 12_000_000) { toast('SPICE deck exceeds the 12 MB limit.'); return; }
+  try {
+    const content = await file.text();
+    await uploadSource(`/api/projects/${encodeURIComponent(currentProject.project_id)}/simulation-deck`, content, 'A SPICE deck');
+    await refreshProject(currentProject.project_id);
+    toast('SPICE deck attached and passed the static directive allowlist; simulation has not run.');
+  } catch (error) { toast(error.message); }
+}
+async function runNgspice() {
+  if (!currentProject) return;
+  toast('Running local ngspice batch simulation…');
+  try {
+    const response = await fetch(`/api/projects/${encodeURIComponent(currentProject.project_id)}/integrations/ngspice`, {method:'POST'});
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `Simulation request failed (${response.status})`);
+    await refreshProject(currentProject.project_id);
+    toast(`ngspice status: ${result.status}. See ngspice_result.json and tool run log.`);
   } catch (error) { toast(error.message); }
 }
 async function runKiCadErc() {
@@ -181,6 +215,10 @@ $('#validate-circuit').addEventListener('click', validateCircuitDraft);
 $('#schematic-file').addEventListener('change', (event) => {
   const file = event.target.files?.[0]; event.target.value = '';
   importSchematicFile(file);
+});
+$('#spice-file').addEventListener('change', (event) => {
+  const file = event.target.files?.[0]; event.target.value = '';
+  importSpiceFile(file);
 });
 $('#circuit-form').addEventListener('submit', async (event) => {
   event.preventDefault();

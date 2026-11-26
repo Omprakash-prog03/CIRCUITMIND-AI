@@ -17,7 +17,7 @@
     <div class="side-bottom"><div class="status-dot"></div><div><b>Local workspace</b><small>Your engineering files stay here</small></div><span class="lock">⌑</span></div>
   </aside>
   <main class="main">
-    <header class="topbar"><div class="crumb"><span>Workspace</span><span class="crumb-slash">/</span><b id="crumb-current">New project</b></div><div class="top-right"><span class="local-pill"><i></i> LOCAL ENGINE</span><span class="version">v0.3.0</span></div></header>
+    <header class="topbar"><div class="crumb"><span>Workspace</span><span class="crumb-slash">/</span><b id="crumb-current">New project</b></div><div class="top-right"><span class="local-pill"><i></i> LOCAL ENGINE</span><span class="version">v0.4.0</span></div></header>
     <section id="view-new" class="view">
       <div class="hero"><div class="eyebrow"><span class="eyebrow-line"></span> AUTONOMOUS ELECTRONICS ENGINEERING</div><h1>From brief to<br><em>build-ready.</em></h1><p>Describe the system. Share the parts on your bench. CIRCUITMIND turns your brief into a traceable engineering project—and tells you what still needs validating.</p></div>
       <div class="grid-layout">
@@ -53,6 +53,7 @@ Capacitors (assorted)</textarea>
   </main>
   <div id="toast" class="toast" role="status"></div>
   <input id="schematic-file" type="file" accept=".kicad_sch" hidden>
+  <input id="spice-file" type="file" accept=".cir,.sp,.ckt" hidden>
   <dialog id="artifact-dialog"><div class="dialog-head"><div><span class="eyebrow">PROJECT ARTIFACT</span><h2 id="artifact-title">Artifact</h2></div><button id="dialog-close" class="icon-button" aria-label="Close">×</button></div><pre id="artifact-content"></pre></dialog>
   <dialog id="circuit-dialog"><form id="circuit-form"><div class="dialog-head"><div><span class="eyebrow">EDITABLE CIRCUIT DATA · SCHEMA V2</span><h2>Circuit model</h2></div><button type="button" class="icon-button" data-close="circuit-dialog" aria-label="Close">×</button></div><p class="dialog-note">Edit the JSON component/pin/net graph. This checks schema and graph references only—not electrical rules or datasheet correctness. Use exact KiCad library IDs only when verified against an installed library.</p><textarea id="circuit-json" spellcheck="false" aria-label="Editable circuit model JSON"></textarea><div id="circuit-feedback" class="dialog-feedback" role="status"></div><div class="dialog-actions"><button type="button" id="validate-circuit" class="small-button">Check model</button><button type="submit" class="primary-button"><span>Save revision</span><span class="button-arrow">→</span></button></div></form></dialog>
   <dialog id="snapshots-dialog"><div class="dialog-head"><div><span class="eyebrow">VERSION HISTORY</span><h2>Model snapshots</h2></div><button type="button" class="icon-button" data-close="snapshots-dialog" aria-label="Close">×</button></div><div id="snapshots-list" class="snapshot-list"></div></dialog>
