@@ -204,6 +204,44 @@ class CircuitApiTests(unittest.TestCase):
         self.assertIn("none was inferred", audit["components"][0]["reason"])
         self.assertEqual(audit["unresolved_count"], 1)
 
+    def test_graph_bound_rc_transient_saves_traces_and_bounded_history_summary(self):
+        _, created = self.call("/api/projects", {"name": "RC transient", "description": "Explicit RC step response", "inventory": "", "architecture": "esp32"}, "POST")
+        project_id = created["project_id"]
+        pins = [{"number": "1", "name": "A", "type": "passive"}, {"number": "2", "name": "B", "type": "passive"}]
+        components = [{"reference": ref, "value": description, "symbol": None, "footprint": None,
+                       "datasheet": None, "pins": pins, "position_mm": {"x": x, "y": 10}, "rotation_deg": 0}
+                      for ref, description, x in (("V1", "unverified supply", 10), ("R1", "1000 ohm? descriptive only", 20), ("C1", "1uF? descriptive only", 30))]
+        model = {"schema_version": 2, "metadata": {"units": "mm", "grid_mm": 1.27}, "status": "draft", "components": components,
+                 "nets": [{"name": "VIN", "terminals": [{"reference": "V1", "pin": "1"}, {"reference": "R1", "pin": "1"}]},
+                          {"name": "OUT", "terminals": [{"reference": "R1", "pin": "2"}, {"reference": "C1", "pin": "1"}]},
+                          {"name": "GND", "terminals": [{"reference": "V1", "pin": "2"}, {"reference": "C1", "pin": "2"}]}],
+                 "inventory": [], "limitations": []}
+        self.assertEqual(self.call(f"/api/projects/{project_id}/circuit", {"model": model}, "PUT")[0], 200)
+        step_waveform = {"type": "step", "initial": {"value": 0, "unit": "V"},
+                         "final": {"value": 5, "unit": "V"}, "step_time": {"value": 0, "unit": "s"}}
+        mapping = {"ground_net": "GND", "bindings": [
+            {"reference": "V1", "type": "voltage_source", "pins": ["1", "2"], "value": step_waveform},
+            {"reference": "R1", "type": "resistor", "pins": ["1", "2"], "value": {"value": 1, "unit": "kohm"}},
+            {"reference": "C1", "type": "capacitor", "pins": ["1", "2"], "value": {"value": 1, "unit": "uF"},
+             "initial_voltage": {"value": 0, "unit": "V"}},
+        ], "exclusions": []}
+        code, report = self.call(f"/api/projects/{project_id}/simulations/transient-rc/from-model", {
+            "mapping": mapping, "time_step": {"value": .0001, "unit": "s"}, "stop_time": {"value": .001, "unit": "s"}}, "POST")
+        self.assertEqual(code, 201)
+        self.assertEqual(report["kind"], "circuit_graph_bound_linear_rc_transient")
+        self.assertEqual(report["calculation"]["outputs"]["sample_count"], 11)
+        output_node = report["mapping_report"]["net_name_to_solver_node"]["OUT"]
+        self.assertAlmostEqual(report["calculation"]["outputs"]["node_voltage_traces_v"][output_node][-1], 5 * (1 - 1.1**-10))
+        self.assertEqual(report["component_coverage"]["excluded"], 0)
+        self.assertIn("descriptive only", model["components"][1]["value"])
+        code, history = self.call(f"/api/projects/{project_id}/simulations")
+        self.assertEqual(code, 200)
+        summary = history["simulations"][-1]
+        self.assertEqual(summary["netlist_status"], "intact")
+        self.assertEqual(summary["mapping_status"], "intact")
+        self.assertEqual(summary["outputs"]["sample_count"], 11)
+        self.assertNotIn("node_voltage_traces_v", summary["outputs"])
+
     def test_graph_bound_mna_requires_explicit_complete_component_mapping(self):
         _, created = self.call("/api/projects", {"name": "Graph-bound MNA", "description": "Explicit net mapping", "inventory": "", "architecture": "discrete"}, "POST")
         project_id = created["project_id"]

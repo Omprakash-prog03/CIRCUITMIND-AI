@@ -2,7 +2,7 @@
 
 ## Current implemented scope
 
-`circuitmind.engineering` is a pure-Python calculation library. It does not invoke ngspice or infer values from a component label. Project-linked workflows include a bounded DC LED-series-resistor analysis, a nearest-integer clock-divider candidate, a clock timebase rate-error budget, and a small explicit-netlist linear DC modified-nodal-analysis (MNA) operating-point solver, accompanied by foundational Ohm's law, resistor/capacitor series-parallel networks, RC time constant, and ideal capacitor/inductor energy calculations.
+`circuitmind.engineering` is a pure-Python calculation library. It does not invoke ngspice or infer values from a component label. Project-linked workflows include a bounded DC LED-series-resistor analysis, a nearest-integer clock-divider candidate, a clock timebase rate-error budget, a small explicit-netlist linear DC modified-nodal-analysis (MNA) operating-point solver, and a graph-bound linear RC backward-Euler transient solver, accompanied by foundational Ohm's law, resistor/capacitor series-parallel networks, RC time constant, and ideal capacitor/inductor energy calculations.
 
 Every quantity is entered as `{ "value": number, "unit": "..." }`. Supported input unit conversions are explicit and dimension-checked. Values are normalized to SI before calculation; result inputs retain original and SI values. NaN, infinity, booleans, unsupported unit spellings, wrong dimensions and nonpositive values where prohibited fail closed.
 
@@ -51,7 +51,15 @@ The JSON netlist has an explicit ground label and two-terminal elements with typ
 
 A graph-bound endpoint, `POST /api/projects/<id>/simulations/dc-operating-point/from-model`, uses saved graph connectivity but still requires an explicit mapping for every component: supported R/V/I type, both declared pin numbers in order, and a typed numeric value; otherwise a component must be explicitly excluded with a reason. It does not parse the component's description, symbol ID, or datasheet. The report retains the model hash, mapping hash, generated netlist hash, net-to-solver-node table, mapped/excluded lists, and residuals. “All components accounted for” means only that each was mapped or explicitly excluded—not that the electrical model is complete or physically correct. Exclusions are omitted from the solve and visibly warn that it is partial.
 
-This is a real numerical **linear DC operating-point solve**, not a transient simulation, nonlinear SPICE run, or result from ngspice. Capacitors/inductors, dependent sources, semiconductor models, tolerances, temperature, parasitics, and transient behavior are unsupported. The user-supplied netlist is hash-recorded but is not generated from or compared with the saved circuit graph. A model edit is shown separately from netlist integrity; it does not claim that the netlist changed or rerun it.
+This is a real numerical **linear DC operating-point solve**, not a nonlinear SPICE run or result from ngspice. Capacitors/inductors, dependent sources, semiconductor models, tolerances, temperature, parasitics, and transient behavior are unsupported. The user-supplied netlist is hash-recorded but is not generated from or compared with the saved circuit graph. A model edit is shown separately from netlist integrity; it does not claim that the netlist changed or rerun it.
+
+## Linear RC transient
+
+`POST /api/projects/<id>/simulations/transient-rc/from-model` executes a fixed-step, backward-Euler simulation on a saved graph's connectivity. It requires an explicit per-run R/C/V/I mapping, ordered declared pins, units and values, a source that is either constant or a single ideal step, and an initial voltage for every capacitor. Every saved component must be mapped or explicitly excluded. The report stores circuit, mapping, and generated-netlist hashes and the full time/node/capacitor traces; `GET /api/projects/<id>/simulations` returns a compact trace summary to avoid returning all samples in history responses.
+
+The companion model is `G_C = C/Δt`, `I_eq = -(C/Δt)·V_C,previous`; the source changes at its requested step time and is sampled at the first following timestep. The initial network is solved using the supplied capacitor initial voltages as ideal voltage constraints; incompatible ideal initial/source conditions are rejected.
+
+The implementation is capped at 100 elements, 24 non-ground nodes, 32 effective MNA unknowns, and 2,000 fixed steps. Only ideal linear RC networks with independent DC/one-step sources are supported. Backward Euler damps fast transients; timestep adequacy and convergence are not assessed, so repeat with smaller steps to compare sensitivity. Inductors, nonlinear semiconductors, parasitics, temperature, and component tolerances are unsupported. This is an actual in-process numerical time-domain simulation, but not ngspice-equivalent validation or design approval.
 
 ## Clock timebase error budget
 

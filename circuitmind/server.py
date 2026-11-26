@@ -16,7 +16,8 @@ from . import __version__
 from .circuit_schema import export_kicad_netlist, migrate_model, validate_model
 from .integrations import discover_integrations, run_kicad_drc, run_kicad_erc, run_ngspice, run_pdftotext
 from .kicad_symbols import resolve_kicad_symbol
-from .engineering import clock_divider_candidate, clock_timebase_error, led_series_resistor, solve_dc_operating_point, map_circuit_graph_to_mna
+from .engineering import (clock_divider_candidate, clock_timebase_error, led_series_resistor,
+                          solve_dc_operating_point, map_circuit_graph_to_mna, simulate_transient_rc)
 from .spice import validate_spice_deck
 from .models import ProjectInput
 from .project_store import list_snapshots, load_circuit, restore_snapshot, save_circuit
@@ -113,8 +114,11 @@ class Handler(BaseHTTPRequestHandler):
                 model = load_circuit(folder)
                 current_hash = hashlib.sha256(json.dumps(model, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
                 runs = []
-                for report_path in folder.glob("simulation_mna_*.json"):
+                report_paths = sorted([*folder.glob("simulation_mna_*.json"), *folder.glob("simulation_transient_rc_*.json")])
+                for report_path in report_paths:
                     report = json.loads(report_path.read_text("utf-8"))
+                    if report.get("kind") not in {"linear_dc_mna_operating_point", "circuit_graph_bound_linear_dc_mna_operating_point", "circuit_graph_bound_linear_rc_transient"}:
+                        continue
                     netlist = report.get("input_netlist", report.get("generated_netlist"))
                     recorded_netlist_hash = report.get("netlist_sha256")
                     if not isinstance(netlist, dict):
@@ -131,13 +135,25 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         actual_mapping_hash = hashlib.sha256(json.dumps(input_mapping, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
                         mapping_status = "intact" if actual_mapping_hash == recorded_mapping_hash else "hash-mismatch"
+                    calculation = report.get("calculation", {})
+                    outputs = calculation.get("outputs", {}) if isinstance(calculation, dict) else {}
+                    if isinstance(outputs, dict) and "time_points_s" in outputs:
+                        times = outputs.get("time_points_s", [])
+                        node_traces = outputs.get("node_voltage_traces_v", {})
+                        cap_traces = outputs.get("capacitor_voltage_traces_v", {})
+                        outputs = {"method": outputs.get("method"), "status": outputs.get("status"),
+                                   "sample_count": outputs.get("sample_count"), "time_step": outputs.get("time_step"),
+                                   "stop_time": outputs.get("stop_time"), "final_time_s": times[-1] if times else None,
+                                   "final_node_voltages_v": {node: trace[-1] for node, trace in node_traces.items() if trace},
+                                   "final_capacitor_voltages_v": {ref: trace[-1] for ref, trace in cap_traces.items() if trace},
+                                   "trace_node_count": len(node_traces), "trace_capacitor_count": len(cap_traces)}
                     runs.append({"run_id": report.get("run_id"), "kind": report.get("kind"),
                                  "created_at": report.get("created_at"), "artifact": report_path.name,
                                  "model_status": "same-at-run" if report.get("circuit_model_sha256") == current_hash else "model-changed-since-run",
                                  "netlist_status": netlist_status, "netlist_sha256": recorded_netlist_hash,
                                  "mapping_status": mapping_status,
                                  "circuit_model_sha256": report.get("circuit_model_sha256"),
-                                 "outputs": report.get("calculation", {}).get("outputs", {})})
+                                 "outputs": outputs})
                 runs.sort(key=lambda item: (item.get("created_at", ""), item.get("run_id", "")))
                 return self._json(200, {"current_circuit_model_sha256": current_hash, "simulations": runs})
             except (OSError, json.JSONDecodeError, ValueError, TypeError) as exc:
@@ -238,6 +254,59 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         parts = path.strip("/").split("/")
+        if len(parts) == 6 and parts[:2] == ["api", "projects"] and parts[3:] == ["simulations", "transient-rc", "from-model"]:
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            try:
+                payload = self._read_payload(200_000)
+                if set(payload) != {"mapping", "time_step", "stop_time"} or not isinstance(payload.get("mapping"), dict):
+                    raise ValueError("Request must contain exactly mapping, time_step, and stop_time")
+                with _project_tool_lock(project_id), _CIRCUIT_API_LOCK:
+                    model = load_circuit(folder)
+                    topology = validate_model(model)
+                    if not topology["topology_valid"]:
+                        return self._json(409, {"error": "Saved circuit model failed schema/topology checks", "topology_report": topology})
+                    resolved = map_circuit_graph_to_mna(model, payload["mapping"], allow_capacitors=True)
+                    simulation_input = {"ground": resolved["netlist"]["ground"], "time_step": payload["time_step"],
+                                        "stop_time": payload["stop_time"], "method": "backward_euler",
+                                        "elements": resolved["netlist"]["elements"]}
+                    calculation = simulate_transient_rc(simulation_input)
+                    calculation["scope"] = "Numerical backward-Euler time-domain simulation with connectivity from the saved graph and explicit user component types, ordered pins, values, sources, and initial conditions; not datasheet or design approval."
+                    calculation["warnings"].append("Graph connectivity came from the saved model; element types, values, source waveform, and capacitor initial conditions came from the per-run user mapping.")
+                    if resolved["excluded_components"]:
+                        calculation["warnings"].append("Excluded components were omitted; this transient solve covers only the explicitly mapped RC subnetwork.")
+                    model_hash = hashlib.sha256(json.dumps(model, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+                    mapping = payload["mapping"]
+                    mapping_hash = hashlib.sha256(json.dumps(mapping, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+                    netlist_hash = hashlib.sha256(json.dumps(simulation_input, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+                    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+                    report_name = f"simulation_transient_rc_{run_id}.json"
+                    created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    report = {"run_id": run_id, "kind": "circuit_graph_bound_linear_rc_transient", "created_at": created_at,
+                              "circuit_model_sha256": model_hash, "mapping_sha256": mapping_hash, "netlist_sha256": netlist_hash,
+                              "input_mapping": mapping, "mapping_report": resolved,
+                              "component_coverage": resolved["component_coverage"],
+                              "input_values_source": "saved graph supplies connectivity; per-run explicit mapping supplies R/C/source models, waveform, pin order, and initial conditions",
+                              "calculation": calculation, "generated_netlist": simulation_input, "artifact": report_name}
+                    _atomic_bytes(folder / report_name, (json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode())
+                    with (folder / "simulation_runs.jsonl").open("a", encoding="utf-8") as log:
+                        log.write(json.dumps({"run_id": run_id, "kind": report["kind"], "created_at": created_at,
+                                              "circuit_model_sha256": model_hash, "mapping_sha256": mapping_hash,
+                                              "netlist_sha256": netlist_hash, "artifact": report_name}, ensure_ascii=False, allow_nan=False) + "\n")
+                        log.flush()
+                        os.fsync(log.fileno())
+                    _update_project_record(folder)
+                return self._json(201, report)
+            except RequestTooLarge as exc:
+                return self._json(413, {"error": str(exc)})
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+                return self._json(422, {"error": str(exc)})
+            except OSError as exc:
+                return self._json(500, {"error": f"RC transient report could not be stored: {exc}"})
         if len(parts) == 6 and parts[:2] == ["api", "projects"] and parts[3:] == ["simulations", "dc-operating-point", "from-model"]:
             project_id = parts[2]
             if not _valid_id(project_id):

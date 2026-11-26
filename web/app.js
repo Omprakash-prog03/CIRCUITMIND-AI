@@ -49,7 +49,7 @@ function renderResult(project) {
   const artifactButtons = (project.artifacts || []).map((name) => name.endsWith('.raw') || name.endsWith('.pdf')
     ? `<a class="artifact-button" href="/api/projects/${encodeURIComponent(project.project_id)}/artifact/${encodeURIComponent(name)}" download>↓ &nbsp;Download ${escapeHtml(name)}</a>`
     : `<button class="artifact-button" data-artifact="${escapeHtml(name)}">↗ &nbsp;${escapeHtml(name)}</button>`).join('');
-  $('#view-result').innerHTML = `<div class="result-top"><div class="eyebrow"><span class="eyebrow-line"></span> ENGINEERING INTAKE COMPLETE</div><h1>${escapeHtml(project.name)}</h1><p>${escapeHtml(project.architecture)} architecture · Created ${escapeHtml(new Date(project.created_at).toLocaleString())}</p><div class="result-actions"><a class="primary-button" href="/api/projects/${encodeURIComponent(project.project_id)}/export"><span>Download project ZIP</span><span class="button-arrow">↓</span></a><button class="small-button" id="edit-circuit">Edit circuit model</button><button class="small-button" id="run-led-resistor-calculation">Analyze LED resistor</button><button class="small-button" id="run-clock-timebase-calculation">Analyze clock timebase</button><button class="small-button" id="run-clock-divider-calculation">Find divider candidate</button><button class="small-button" id="run-dc-mna">Solve explicit linear DC MNA</button><button class="small-button" id="run-graph-mna">Map graph to MNA</button><button class="small-button" id="import-schematic">Import KiCad schematic</button><button class="small-button" id="run-kicad-erc">Run KiCad ERC</button><button class="small-button" id="import-board">Import KiCad PCB</button><button class="small-button" id="run-kicad-drc">Run KiCad DRC</button><button class="small-button" id="import-datasheet">Import datasheet PDF</button><button class="small-button" id="extract-datasheet-text">Extract latest PDF text</button><button class="small-button" id="import-spice">Import SPICE deck</button><button class="small-button" id="run-ngspice">Run ngspice</button><button class="small-button" id="show-snapshots">Snapshots</button><button class="small-button" id="back-to-brief">← New analysis</button></div></div>
+  $('#view-result').innerHTML = `<div class="result-top"><div class="eyebrow"><span class="eyebrow-line"></span> ENGINEERING INTAKE COMPLETE</div><h1>${escapeHtml(project.name)}</h1><p>${escapeHtml(project.architecture)} architecture · Created ${escapeHtml(new Date(project.created_at).toLocaleString())}</p><div class="result-actions"><a class="primary-button" href="/api/projects/${encodeURIComponent(project.project_id)}/export"><span>Download project ZIP</span><span class="button-arrow">↓</span></a><button class="small-button" id="edit-circuit">Edit circuit model</button><button class="small-button" id="run-led-resistor-calculation">Analyze LED resistor</button><button class="small-button" id="run-clock-timebase-calculation">Analyze clock timebase</button><button class="small-button" id="run-clock-divider-calculation">Find divider candidate</button><button class="small-button" id="run-dc-mna">Solve explicit linear DC MNA</button><button class="small-button" id="run-graph-mna">Map graph to DC MNA</button><button class="small-button" id="run-rc-transient">Run graph RC transient</button><button class="small-button" id="import-schematic">Import KiCad schematic</button><button class="small-button" id="run-kicad-erc">Run KiCad ERC</button><button class="small-button" id="import-board">Import KiCad PCB</button><button class="small-button" id="run-kicad-drc">Run KiCad DRC</button><button class="small-button" id="import-datasheet">Import datasheet PDF</button><button class="small-button" id="extract-datasheet-text">Extract latest PDF text</button><button class="small-button" id="import-spice">Import SPICE deck</button><button class="small-button" id="run-ngspice">Run ngspice</button><button class="small-button" id="show-snapshots">Snapshots</button><button class="small-button" id="back-to-brief">← New analysis</button></div></div>
   <div class="status-banner">⚠ &nbsp; Incomplete — this is requirements and feasibility analysis, not a completed electrical design.</div>
   <div class="result-grid"><div><section class="result-panel"><h2>Feasibility findings <span class="optional">${findings.length} ITEMS</span></h2>${findings.map((finding) => `<div class="finding"><span class="finding-icon">!</span><span>${escapeHtml(finding)}</span></div>`).join('')}</section>
   <section class="result-panel"><h2>Supplied component inventory</h2>${inventoryRows ? `<table class="inventory-table"><thead><tr><th>PART / DESCRIPTION</th><th>QTY</th><th>VERIFICATION</th></tr></thead><tbody>${inventoryRows}</tbody></table>` : '<div class="empty-state">No inventory provided.</div>'}</section></div>
@@ -62,6 +62,7 @@ function renderResult(project) {
   $('#run-clock-divider-calculation').addEventListener('click', openClockDividerCalculation);
   $('#run-dc-mna').addEventListener('click', openMnaDialog);
   $('#run-graph-mna').addEventListener('click', openGraphMnaDialog);
+  $('#run-rc-transient').addEventListener('click', openGraphTransientDialog);
   loadCalculationStatus(project.project_id);
   loadSimulationStatus(project.project_id);
   $('#import-schematic').addEventListener('click', () => $('#schematic-file').click());
@@ -118,7 +119,7 @@ async function loadSimulationStatus(projectId) {
   if (!node) return;
   try {
     const data = await (await request(`/api/projects/${encodeURIComponent(projectId)}/simulations`)).json();
-    if (!data.simulations?.length) { node.innerHTML = '<div class="empty-state">No linear DC MNA runs have been saved.</div>'; return; }
+    if (!data.simulations?.length) { node.innerHTML = '<div class="empty-state">No linear DC MNA or RC transient runs have been saved.</div>'; return; }
     node.innerHTML = [...data.simulations].reverse().map((run) => `<div class="validation-line"><span>${escapeHtml(run.kind.replaceAll('_',' '))}</span><span class="calc-state ${run.model_status === 'same-at-run' && run.netlist_status === 'intact' ? 'current' : 'stale'}">${escapeHtml(run.model_status)} · netlist ${escapeHtml(run.netlist_status)} · map ${escapeHtml(run.mapping_status)} · ${escapeHtml(new Date(run.created_at).toLocaleString())}</span></div>`).join('');
   } catch (error) { node.textContent = `Simulation history unavailable: ${error.message}`; }
 }
@@ -182,6 +183,44 @@ async function runGraphMna(event) {
     const artifactList = $('#view-result .artifact-list');
     if (artifactList && !artifactList.querySelector(`[data-artifact="${report.artifact}"]`)) {
       const button = document.createElement('button'); button.className = 'artifact-button'; button.textContent = `↗  ${report.artifact}`;
+      button.addEventListener('click', () => openArtifact(projectId, report.artifact)); artifactList.append(button);
+    }
+  } catch (error) {
+    feedback.textContent = error.message; feedback.className = 'dialog-feedback error';
+  }
+}
+function openGraphTransientDialog() {
+  $('#rc-transient-feedback').textContent = 'Enter a complete mapping plus a fixed timestep and stop time. R/C/source values, waveforms, capacitor initial voltages, and pin order must be explicit; the app will not infer them.';
+  $('#rc-transient-feedback').className = 'dialog-feedback';
+  $('#rc-transient-dialog').showModal();
+}
+async function runGraphTransient(event) {
+  event.preventDefault();
+  const feedback = $('#rc-transient-feedback');
+  try {
+    const mapping = JSON.parse($('#rc-transient-mapping').value);
+    const projectId = currentProject.project_id;
+    const payload = {mapping,
+      time_step:{value:optionalNumber('rc-transient-step'), unit:'s'},
+      stop_time:{value:optionalNumber('rc-transient-stop'), unit:'s'}};
+    const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/simulations/transient-rc/from-model`, {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)
+    });
+    const report = await response.json();
+    if (!response.ok) throw new Error(report.error || `RC transient solve failed (${response.status})`);
+    const out = report.calculation.outputs;
+    const netMap = report.mapping_report.net_name_to_solver_node;
+    const finalNodes = Object.entries(netMap).map(([name,node]) => `${name}: ${Number(out.node_voltage_traces_v[node].at(-1)).toPrecision(7)} V`).join('\n');
+    const finalCaps = Object.entries(out.capacitor_voltage_traces_v).map(([ref,trace]) => `${ref}: ${Number(trace.at(-1)).toPrecision(7)} V`).join('\n');
+    const coverage = report.component_coverage;
+    feedback.textContent = `Backward Euler linear-RC time-domain run · ${out.sample_count} samples through ${Number(out.stop_time.value).toPrecision(6)} s.\nFinal node voltages:\n${finalNodes}\nFinal capacitor voltages:\n${finalCaps}\nComponents mapped: ${coverage.mapped}; explicitly excluded: ${coverage.excluded} of ${coverage.total}.\n${report.calculation.warnings.join(' ')}\nModel SHA-256 ${report.circuit_model_sha256.slice(0,16)}…; mapping SHA-256 ${report.mapping_sha256.slice(0,16)}…; full traces saved in ${report.artifact}.`;
+    feedback.className = coverage.has_exclusions ? 'dialog-feedback' : 'dialog-feedback ok';
+    await loadProjects();
+    currentProject = projectCache.find((project) => project.project_id === projectId) || currentProject;
+    await loadSimulationStatus(projectId);
+    const artifactList = $('#view-result .artifact-list');
+    if (artifactList && !artifactList.querySelector(`[data-artifact="${report.artifact}"]`)) {
+      const button = document.createElement('button'); button.className = 'artifact-button'; button.dataset.artifact = report.artifact; button.textContent = `↗  ${report.artifact}`;
       button.addEventListener('click', () => openArtifact(projectId, report.artifact)); artifactList.append(button);
     }
   } catch (error) {
@@ -551,6 +590,7 @@ $('#clock-timebase-form').addEventListener('submit', calculateClockTimebase);
 $('#clock-divider-form').addEventListener('submit', calculateClockDivider);
 $('#mna-form').addEventListener('submit', runMna);
 $('#graph-mna-form').addEventListener('submit', runGraphMna);
+$('#rc-transient-form').addEventListener('submit', runGraphTransient);
 $('#circuit-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   try {
