@@ -17,7 +17,9 @@ from .circuit_schema import export_kicad_netlist, migrate_model, validate_model
 from .integrations import discover_integrations, run_kicad_drc, run_kicad_erc, run_ngspice, run_pdftotext
 from .kicad_symbols import resolve_kicad_symbol
 from .engineering import (clock_divider_candidate, clock_timebase_error, led_series_resistor,
-                          solve_dc_operating_point, map_circuit_graph_to_mna, simulate_transient_rc)
+                          solve_dc_operating_point, map_circuit_graph_to_mna, simulate_transient_rc,
+                          synthesize_rc_lowpass)
+from .engineering.cpp_engine import CppEngineUnavailable
 from .spice import validate_spice_deck
 from .models import ProjectInput
 from .project_store import list_snapshots, load_circuit, restore_snapshot, save_circuit
@@ -254,6 +256,76 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         parts = path.strip("/").split("/")
+        if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["designs", "rc-low-pass"]:
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            try:
+                payload = self._read_payload(200_000)
+                if set(payload) != {"request_version", "inputs", "apply_to_circuit"} or not isinstance(payload.get("inputs"), dict):
+                    raise ValueError("Request must contain exactly request_version, inputs, and apply_to_circuit")
+                if type(payload.get("request_version")) is not int or payload["request_version"] != 1:
+                    raise ValueError("Only RC low-pass synthesis request_version 1 is supported")
+                if not isinstance(payload.get("apply_to_circuit"), bool):
+                    raise ValueError("apply_to_circuit must be an explicit boolean")
+                with _project_tool_lock(project_id), _CIRCUIT_API_LOCK:
+                    current_model = load_circuit(folder)
+                    current_topology = validate_model(current_model)
+                    if not current_topology["topology_valid"]:
+                        return self._json(409, {"error": "Saved circuit model failed schema/topology checks", "topology_report": current_topology})
+                    result = synthesize_rc_lowpass(payload["inputs"])
+                    candidate = result["circuit_model_candidate"]
+                    apply_refused_reason = None
+                    applied = payload["apply_to_circuit"]
+                    if applied and result["constraints"]["nominal_cutoff_error"] != "pass":
+                        applied = False
+                        apply_refused_reason = "Candidate failed the user-defined nominal cutoff error constraint; it was retained as an artifact but not applied to the saved graph."
+                    if applied:
+                        snapshots = save_circuit(project_id, folder, candidate)
+                        export_report = _refresh_circuit_artifacts(project_id, folder, candidate)
+                    else:
+                        snapshots = None
+                        export_report = None
+                    current_hash = hashlib.sha256(json.dumps(load_circuit(folder), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+                    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+                    created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    request_document = {"request_version": payload["request_version"], "inputs": payload["inputs"],
+                                        "apply_to_circuit": applied}
+                    request_hash = hashlib.sha256(json.dumps(request_document, sort_keys=True, separators=(",", ":"),
+                                                               ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+                    report_name = f"design_rc_lowpass_{run_id}.json"
+                    report = {"run_id": run_id, "kind": "synthesized_single_pole_rc_lowpass", "created_at": created_at,
+                              "request_version": payload["request_version"], "request_sha256": request_hash,
+                              "workflow_version": result["workflow_version"], "requirements": result["requirements"],
+                              "candidate_circuit_model_sha256": result["circuit_model_sha256"],
+                              "current_saved_circuit_model_sha256": current_hash,
+                              "candidate_is_current_saved_model": result["circuit_model_sha256"] == current_hash,
+                              "apply_requested": payload["apply_to_circuit"], "applied_to_circuit_model": applied,
+                              "apply_refused_reason": apply_refused_reason,
+                              "snapshots": snapshots,
+                              "kicad_export": export_report, "design": result, "artifact": report_name}
+                    _atomic_bytes(folder / report_name, (json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode())
+                    with (folder / "design_runs.jsonl").open("a", encoding="utf-8") as log:
+                        log.write(json.dumps({"run_id": run_id, "kind": report["kind"], "created_at": created_at,
+                                              "request_sha256": request_hash,
+                                              "candidate_circuit_model_sha256": result["circuit_model_sha256"],
+                                              "current_saved_circuit_model_sha256": current_hash,
+                                              "applied_to_circuit_model": applied, "artifact": report_name}, ensure_ascii=False, allow_nan=False) + "\n")
+                        log.flush()
+                        os.fsync(log.fileno())
+                    _update_project_record(folder)
+                return self._json(201, report)
+            except CppEngineUnavailable as exc:
+                return self._json(503, {"error": str(exc)})
+            except RequestTooLarge as exc:
+                return self._json(413, {"error": str(exc)})
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+                return self._json(422, {"error": str(exc)})
+            except OSError as exc:
+                return self._json(500, {"error": f"RC low-pass synthesis report could not be stored: {exc}"})
         if len(parts) == 6 and parts[:2] == ["api", "projects"] and parts[3:] == ["simulations", "transient-rc", "from-model"]:
             project_id = parts[2]
             if not _valid_id(project_id):

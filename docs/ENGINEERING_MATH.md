@@ -2,9 +2,13 @@
 
 ## Current implemented scope
 
-`circuitmind.engineering` is a pure-Python calculation library. It does not invoke ngspice or infer values from a component label. Project-linked workflows include a bounded DC LED-series-resistor analysis, a nearest-integer clock-divider candidate, a clock timebase rate-error budget, a small explicit-netlist linear DC modified-nodal-analysis (MNA) operating-point solver, and a graph-bound linear RC backward-Euler transient solver, accompanied by foundational Ohm's law, resistor/capacitor series-parallel networks, RC time constant, and ideal capacitor/inductor energy calculations.
+`circuitmind.engineering` is the Python calculation/workflow layer. It does not infer values from a component label. The repository now also has an independent C++20 core in `core/`; the bounded RC-low-pass synthesis workflow invokes that native core through C ABI v1 for its authoritative transient result. Existing Python DC MNA and generic transient functions remain legacy implementations pending migration and must not be confused with the new C++ execution path. Project-linked workflows include bounded DC/RC calculations, a low-pass candidate synthesis, LED-series-resistor analysis, clock divider/timebase work, and foundational Ohm's law, resistor/capacitor networks, RC time constant, and ideal energy calculations.
 
 Every quantity is entered as `{ "value": number, "unit": "..." }`. Supported input unit conversions are explicit and dimension-checked. Values are normalized to SI before calculation; result inputs retain original and SI values. NaN, infinity, booleans, unsupported unit spellings, wrong dimensions and nonpositive values where prohibited fail closed.
+
+## Native C++ core (foundation milestone)
+
+The C++20 engine is independently built with CMake and contains bounded dense linear DC MNA and fixed-step linear RC backward-Euler transient solving. It accepts typed SI element records through a versioned C ABI; Python validates dimensions and marshals the indexed circuit snapshot, while C++ performs the numerical solve. The new RC low-pass synthesis workflow uses this core; missing native binaries return an explicit service-unavailable error rather than falling back to Python. Build/test commands and current limits are documented in `README.md` and `docs/CIRCUIT_ENGINE_ARCHITECTURE.md`. The existing Python solver implementations are legacy paths until their API/result parity migration is completed.
 
 ## LED series resistor
 

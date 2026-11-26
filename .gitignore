@@ -4,3 +4,6 @@ __pycache__/
 .coverage
 workspace/
 .local-data/
+/build/
+/core/build/
+.preview-workspace/

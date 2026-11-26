@@ -10,6 +10,9 @@ from pathlib import Path
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
+from tests.native_core import ensure_native_core
+ensure_native_core()
+
 import circuitmind.server as app_server
 from circuitmind.server import Handler
 
@@ -203,6 +206,57 @@ class CircuitApiTests(unittest.TestCase):
         self.assertEqual(audit["components"][0]["status"], "no-symbol-id")
         self.assertIn("none was inferred", audit["components"][0]["reason"])
         self.assertEqual(audit["unresolved_count"], 1)
+
+    def test_rc_lowpass_synthesis_generates_candidate_without_mutating_graph_by_default(self):
+        _, created = self.call("/api/projects", {"name": "Synthesized RC", "description": "Explicit 1 kHz low-pass requirement", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        inputs = {"cutoff_frequency": {"value": 1, "unit": "kHz"},
+                  "preferred_resistance": {"value": 10, "unit": "kohm"}, "series": "E24",
+                  "resistor_tolerance_percent": 5, "capacitor_tolerance_percent": 10,
+                  "max_cutoff_error_percent": 5}
+        code, unsupported = self.call(f"/api/projects/{project_id}/designs/rc-low-pass",
+                                      {"request_version": 2, "inputs": inputs, "apply_to_circuit": False}, "POST")
+        self.assertEqual(code, 422)
+        self.assertIn("request_version 1", unsupported["error"])
+        code, report = self.call(f"/api/projects/{project_id}/designs/rc-low-pass",
+                                 {"request_version": 1, "inputs": inputs, "apply_to_circuit": False}, "POST")
+        self.assertEqual(code, 201)
+        self.assertEqual(report["kind"], "synthesized_single_pole_rc_lowpass")
+        self.assertFalse(report["applied_to_circuit_model"])
+        self.assertTrue(report["design"]["graph_validation"]["topology_valid"])
+        self.assertAlmostEqual(report["design"]["selected_values"]["nominal_cutoff_frequency"]["value"], 994.7183943)
+        self.assertEqual(report["design"]["transient_test"]["status"], "completed-numerical-linear-rc-transient")
+        failed_inputs = {**inputs, "max_cutoff_error_percent": 0.1}
+        code, refused = self.call(f"/api/projects/{project_id}/designs/rc-low-pass",
+                                  {"request_version": 1, "inputs": failed_inputs, "apply_to_circuit": True}, "POST")
+        self.assertEqual(code, 201)
+        self.assertTrue(refused["apply_requested"])
+        self.assertFalse(refused["applied_to_circuit_model"])
+        self.assertIn("failed the user-defined", refused["apply_refused_reason"])
+        code, stored = self.call(f"/api/projects/{project_id}/circuit")
+        self.assertEqual(code, 200)
+        self.assertEqual(stored["model"]["components"], [])
+        code, artifact = self.call(f"/api/projects/{project_id}/artifact/{report['artifact']}")
+        self.assertEqual(code, 200)
+        self.assertIn("candidate_circuit_model_sha256", artifact["content"])
+
+    def test_rc_lowpass_synthesis_applies_only_with_explicit_opt_in_and_snapshots(self):
+        _, created = self.call("/api/projects", {"name": "Apply synthesized RC", "description": "Explicit RC filter requirements", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        inputs = {"cutoff_frequency": {"value": 1, "unit": "kHz"},
+                  "preferred_resistance": {"value": 10, "unit": "kohm"}, "series": "E24",
+                  "resistor_tolerance_percent": 5, "capacitor_tolerance_percent": 10,
+                  "max_cutoff_error_percent": 5}
+        code, report = self.call(f"/api/projects/{project_id}/designs/rc-low-pass",
+                                 {"request_version": 1, "inputs": inputs, "apply_to_circuit": True}, "POST")
+        self.assertEqual(code, 201)
+        self.assertTrue(report["applied_to_circuit_model"])
+        self.assertEqual(report["snapshots"]["count"], 1)
+        self.assertTrue(report["candidate_is_current_saved_model"])
+        self.assertEqual(report["kicad_export"]["status"], "blocked")
+        code, stored = self.call(f"/api/projects/{project_id}/circuit")
+        self.assertEqual(code, 200)
+        self.assertEqual({item["reference"] for item in stored["model"]["components"]}, {"V1", "R1", "C1"})
 
     def test_graph_bound_rc_transient_saves_traces_and_bounded_history_summary(self):
         _, created = self.call("/api/projects", {"name": "RC transient", "description": "Explicit RC step response", "inventory": "", "architecture": "esp32"}, "POST")

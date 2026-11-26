@@ -49,7 +49,7 @@ function renderResult(project) {
   const artifactButtons = (project.artifacts || []).map((name) => name.endsWith('.raw') || name.endsWith('.pdf')
     ? `<a class="artifact-button" href="/api/projects/${encodeURIComponent(project.project_id)}/artifact/${encodeURIComponent(name)}" download>↓ &nbsp;Download ${escapeHtml(name)}</a>`
     : `<button class="artifact-button" data-artifact="${escapeHtml(name)}">↗ &nbsp;${escapeHtml(name)}</button>`).join('');
-  $('#view-result').innerHTML = `<div class="result-top"><div class="eyebrow"><span class="eyebrow-line"></span> ENGINEERING INTAKE COMPLETE</div><h1>${escapeHtml(project.name)}</h1><p>${escapeHtml(project.architecture)} architecture · Created ${escapeHtml(new Date(project.created_at).toLocaleString())}</p><div class="result-actions"><a class="primary-button" href="/api/projects/${encodeURIComponent(project.project_id)}/export"><span>Download project ZIP</span><span class="button-arrow">↓</span></a><button class="small-button" id="edit-circuit">Edit circuit model</button><button class="small-button" id="run-led-resistor-calculation">Analyze LED resistor</button><button class="small-button" id="run-clock-timebase-calculation">Analyze clock timebase</button><button class="small-button" id="run-clock-divider-calculation">Find divider candidate</button><button class="small-button" id="run-dc-mna">Solve explicit linear DC MNA</button><button class="small-button" id="run-graph-mna">Map graph to DC MNA</button><button class="small-button" id="run-rc-transient">Run graph RC transient</button><button class="small-button" id="import-schematic">Import KiCad schematic</button><button class="small-button" id="run-kicad-erc">Run KiCad ERC</button><button class="small-button" id="import-board">Import KiCad PCB</button><button class="small-button" id="run-kicad-drc">Run KiCad DRC</button><button class="small-button" id="import-datasheet">Import datasheet PDF</button><button class="small-button" id="extract-datasheet-text">Extract latest PDF text</button><button class="small-button" id="import-spice">Import SPICE deck</button><button class="small-button" id="run-ngspice">Run ngspice</button><button class="small-button" id="show-snapshots">Snapshots</button><button class="small-button" id="back-to-brief">← New analysis</button></div></div>
+  $('#view-result').innerHTML = `<div class="result-top"><div class="eyebrow"><span class="eyebrow-line"></span> ENGINEERING INTAKE COMPLETE</div><h1>${escapeHtml(project.name)}</h1><p>${escapeHtml(project.architecture)} architecture · Created ${escapeHtml(new Date(project.created_at).toLocaleString())}</p><div class="result-actions"><a class="primary-button" href="/api/projects/${encodeURIComponent(project.project_id)}/export"><span>Download project ZIP</span><span class="button-arrow">↓</span></a><button class="small-button" id="edit-circuit">Edit circuit model</button><button class="small-button" id="run-led-resistor-calculation">Analyze LED resistor</button><button class="small-button" id="run-clock-timebase-calculation">Analyze clock timebase</button><button class="small-button" id="run-clock-divider-calculation">Find divider candidate</button><button class="small-button" id="run-dc-mna">Solve explicit linear DC MNA</button><button class="small-button" id="run-graph-mna">Map graph to DC MNA</button><button class="small-button" id="run-rc-transient">Run graph RC transient</button><button class="small-button" id="synthesize-rc-lowpass">Synthesize RC low-pass</button><button class="small-button" id="import-schematic">Import KiCad schematic</button><button class="small-button" id="run-kicad-erc">Run KiCad ERC</button><button class="small-button" id="import-board">Import KiCad PCB</button><button class="small-button" id="run-kicad-drc">Run KiCad DRC</button><button class="small-button" id="import-datasheet">Import datasheet PDF</button><button class="small-button" id="extract-datasheet-text">Extract latest PDF text</button><button class="small-button" id="import-spice">Import SPICE deck</button><button class="small-button" id="run-ngspice">Run ngspice</button><button class="small-button" id="show-snapshots">Snapshots</button><button class="small-button" id="back-to-brief">← New analysis</button></div></div>
   <div class="status-banner">⚠ &nbsp; Incomplete — this is requirements and feasibility analysis, not a completed electrical design.</div>
   <div class="result-grid"><div><section class="result-panel"><h2>Feasibility findings <span class="optional">${findings.length} ITEMS</span></h2>${findings.map((finding) => `<div class="finding"><span class="finding-icon">!</span><span>${escapeHtml(finding)}</span></div>`).join('')}</section>
   <section class="result-panel"><h2>Supplied component inventory</h2>${inventoryRows ? `<table class="inventory-table"><thead><tr><th>PART / DESCRIPTION</th><th>QTY</th><th>VERIFICATION</th></tr></thead><tbody>${inventoryRows}</tbody></table>` : '<div class="empty-state">No inventory provided.</div>'}</section></div>
@@ -63,6 +63,7 @@ function renderResult(project) {
   $('#run-dc-mna').addEventListener('click', openMnaDialog);
   $('#run-graph-mna').addEventListener('click', openGraphMnaDialog);
   $('#run-rc-transient').addEventListener('click', openGraphTransientDialog);
+  $('#synthesize-rc-lowpass').addEventListener('click', openRcLowpassSynthesisDialog);
   loadCalculationStatus(project.project_id);
   loadSimulationStatus(project.project_id);
   $('#import-schematic').addEventListener('click', () => $('#schematic-file').click());
@@ -223,6 +224,43 @@ async function runGraphTransient(event) {
       const button = document.createElement('button'); button.className = 'artifact-button'; button.dataset.artifact = report.artifact; button.textContent = `↗  ${report.artifact}`;
       button.addEventListener('click', () => openArtifact(projectId, report.artifact)); artifactList.append(button);
     }
+  } catch (error) {
+    feedback.textContent = error.message; feedback.className = 'dialog-feedback error';
+  }
+}
+function openRcLowpassSynthesisDialog() {
+  $('#rc-synthesis-feedback').textContent = 'Supported deterministic workflow: one ideal-source, unloaded, single-pole RC low-pass. Inputs below are explicit constraints; no free-text requirements, inventory, catalogue, manufacturer, footprint, or datasheet is inferred.';
+  $('#rc-synthesis-feedback').className = 'dialog-feedback';
+  $('#rc-synthesis-dialog').showModal();
+}
+async function runRcLowpassSynthesis(event) {
+  event.preventDefault();
+  const feedback = $('#rc-synthesis-feedback');
+  try {
+    const inputs = {
+      cutoff_frequency:{value:optionalNumber('rc-synthesis-cutoff'), unit:'Hz'},
+      preferred_resistance:{value:optionalNumber('rc-synthesis-resistance'), unit:'ohm'},
+      series:$('#rc-synthesis-series').value,
+      resistor_tolerance_percent:optionalNumber('rc-synthesis-r-tolerance'),
+      capacitor_tolerance_percent:optionalNumber('rc-synthesis-c-tolerance'),
+      max_cutoff_error_percent:optionalNumber('rc-synthesis-max-error')
+    };
+    const projectId = currentProject.project_id;
+    const apply = $('#rc-synthesis-apply').checked;
+    if (apply && currentProject?.artifacts?.includes('circuit_model.json')) {
+      if (!window.confirm('Replace the saved circuit model with this generated RC candidate? The previous revision will be snapshotted.')) return;
+    }
+    const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/designs/rc-low-pass`, {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({request_version:1, inputs, apply_to_circuit:apply})
+    });
+    const report = await response.json();
+    if (!response.ok) throw new Error(report.error || `RC synthesis failed (${response.status})`);
+    const design = report.design;
+    const values = design.selected_values;
+    const transient = design.transient_test;
+    feedback.textContent = `Candidate status: ${design.design_status}\nTarget cutoff: ${Number(design.requirements.target_cutoff_frequency.value).toPrecision(6)} Hz · selected nominal: ${Number(values.nominal_cutoff_frequency.value).toPrecision(7)} Hz (${Number(values.nominal_cutoff_error_percent).toFixed(4)}%)\nSelected values: R1 ${Number(values.resistance.value).toPrecision(6)} ohm (${design.requirements.series}); C1 ${Number(values.capacitance.value).toPrecision(6)} F\nTolerance cutoff bounds: ${Number(values.cutoff_tolerance_bounds.minimum.value).toPrecision(6)} to ${Number(values.cutoff_tolerance_bounds.maximum.value).toPrecision(6)} Hz\nBackward-Euler unit-step check: ${Number(transient.simulated_final_output_voltage.value).toPrecision(7)} V at ${Number(transient.stop_time.value).toPrecision(6)} s; analytic reference ${Number(transient.analytic_final_output_voltage.value).toPrecision(7)} V.\n${design.findings.join(' ')}\nGraph SHA-256 ${report.candidate_circuit_model_sha256.slice(0,16)}…; artifact ${report.artifact}.${report.applied_to_circuit_model ? ' Candidate applied to the saved circuit model; previous revision snapshotted.' : report.apply_refused_reason ? ` Not applied: ${report.apply_refused_reason}` : ' Saved graph was not changed; candidate is in the report artifact.'}`;
+    feedback.className = design.constraints.nominal_cutoff_error === 'pass' ? 'dialog-feedback ok' : 'dialog-feedback';
+    await refreshProject(projectId);
   } catch (error) {
     feedback.textContent = error.message; feedback.className = 'dialog-feedback error';
   }
@@ -591,6 +629,7 @@ $('#clock-divider-form').addEventListener('submit', calculateClockDivider);
 $('#mna-form').addEventListener('submit', runMna);
 $('#graph-mna-form').addEventListener('submit', runGraphMna);
 $('#rc-transient-form').addEventListener('submit', runGraphTransient);
+$('#rc-synthesis-form').addEventListener('submit', runRcLowpassSynthesis);
 $('#circuit-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   try {

@@ -121,6 +121,8 @@ def validate_model(model: dict[str, Any]) -> dict[str, Any]:
             value = component.get(optional_text)
             if value is not None and not _xml_safe(value):
                 errors.append(f"{ref}.{optional_text} must be XML-safe text or null")
+        if "electrical_model" in component:
+            errors.extend(_validate_electrical_model(component["electrical_model"], ref))
         pins = component.get("pins")
         if not isinstance(pins, list) or not pins:
             errors.append(f"{ref} must declare at least one pin")
@@ -218,6 +220,60 @@ def validate_model(model: dict[str, Any]) -> dict[str, Any]:
     return {"topology_valid": not errors, "errors": errors, "warnings": warnings,
             "component_count": len(components), "net_count": len(model["nets"]), "connected_pin_count": len(connected),
             "scope": "Schema and graph reference consistency only. No symbol-library resolution, electrical rules, voltage compatibility, or KiCad ERC has run."}
+
+
+def _validate_electrical_model(model: Any, reference: str) -> list[str]:
+    """Validate optional typed model v1 records carried by schema-v2 graph nodes."""
+    errors: list[str] = []
+    prefix = f"{reference}.electrical_model"
+    if not isinstance(model, dict) or set(model) != {"model_version", "kind", "parameters", "provenance"}:
+        return [f"{prefix} must contain exactly model_version, kind, parameters, and provenance"]
+    if type(model.get("model_version")) is not int or model["model_version"] != 1:
+        errors.append(f"{prefix}.model_version must be 1")
+    kind = model.get("kind")
+    parameter_fields = {"resistor": {"resistance", "tolerance_percent"},
+                        "capacitor": {"capacitance", "tolerance_percent", "initial_voltage"},
+                        "voltage_source": {"waveform", "source_role"},
+                        "current_source": {"waveform", "source_role"}}
+    if not isinstance(kind, str) or kind not in parameter_fields:
+        errors.append(f"{prefix}.kind must be resistor, capacitor, voltage_source, or current_source")
+        return errors
+    parameters = model.get("parameters")
+    if not isinstance(parameters, dict) or set(parameters) != parameter_fields[kind]:
+        errors.append(f"{prefix}.parameters fields do not match model kind {kind}")
+        return errors
+    if kind in {"resistor", "capacitor"}:
+        field = "resistance" if kind == "resistor" else "capacitance"
+        units = ({"ohm", "Ohm", "Ω", "kohm", "kΩ", "Mohm", "MΩ"} if kind == "resistor"
+                 else {"F", "mF", "uF", "µF", "nF", "pF"})
+        quantity = parameters.get(field)
+        if not isinstance(quantity, dict) or set(quantity) != {"value", "unit"} or not _finite_number(quantity.get("value")) or quantity["value"] <= 0 or not isinstance(quantity.get("unit"), str) or quantity["unit"] not in units:
+            errors.append(f"{prefix}.parameters.{field} must be a positive typed quantity with a supported {field} unit")
+        tolerance = parameters.get("tolerance_percent")
+        if not _finite_number(tolerance) or tolerance < 0 or tolerance > 100:
+            errors.append(f"{prefix}.parameters.tolerance_percent must be between 0 and 100")
+        if kind == "capacitor":
+            initial = parameters.get("initial_voltage")
+            if not isinstance(initial, dict) or set(initial) != {"value", "unit"} or not _finite_number(initial.get("value")) or not isinstance(initial.get("unit"), str) or initial["unit"] not in {"V", "mV", "uV", "µV"}:
+                errors.append(f"{prefix}.parameters.initial_voltage must be a typed voltage quantity")
+    else:
+        waveform = parameters.get("waveform")
+        if not isinstance(waveform, dict) or set(waveform) != {"type", "initial", "final", "step_time"} or waveform.get("type") != "step":
+            errors.append(f"{prefix}.parameters.waveform must be an explicit single-step waveform")
+        else:
+            value_units = {"V", "mV", "uV", "µV"} if kind == "voltage_source" else {"A", "mA", "uA", "µA", "nA"}
+            for key in ("initial", "final"):
+                quantity = waveform.get(key)
+                if not isinstance(quantity, dict) or set(quantity) != {"value", "unit"} or not _finite_number(quantity.get("value")) or not isinstance(quantity.get("unit"), str) or quantity["unit"] not in value_units:
+                    errors.append(f"{prefix}.parameters.waveform.{key} must be a typed source quantity")
+            step = waveform.get("step_time")
+            if not isinstance(step, dict) or set(step) != {"value", "unit"} or not _finite_number(step.get("value")) or step["value"] < 0 or not isinstance(step.get("unit"), str) or step["unit"] not in {"s", "ms", "us", "µs", "ns"}:
+                errors.append(f"{prefix}.parameters.waveform.step_time must be a nonnegative typed time quantity")
+        if not isinstance(parameters.get("source_role"), str) or parameters["source_role"] not in {"testbench", "independent"}:
+            errors.append(f"{prefix}.parameters.source_role must be testbench or independent")
+    if not isinstance(model.get("provenance"), str) or not model["provenance"].strip():
+        errors.append(f"{prefix}.provenance must explain the source of this model")
+    return errors
 
 
 def export_kicad_netlist(model: dict[str, Any], source_name: str = "circuitmind") -> bytes:

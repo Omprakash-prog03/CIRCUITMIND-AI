@@ -119,6 +119,23 @@ class VersionedCircuitSchemaTests(unittest.TestCase):
         model["status"] = "hardware-tested"
         self.assertFalse(validate_model(model)["topology_valid"])
 
+    def test_optional_typed_electrical_model_v1_is_structurally_validated(self):
+        model = new_circuit_model()
+        model["components"] = [{"reference": "R1", "value": "10 kohm", "symbol": None,
+                                "pins": [{"number": "1", "name": "A", "type": "passive"},
+                                         {"number": "2", "name": "B", "type": "passive"}],
+                                "position_mm": {"x": 0, "y": 0}, "rotation_deg": 0,
+                                "electrical_model": {"model_version": 1, "kind": "resistor",
+                                                      "parameters": {"resistance": {"value": 10, "unit": "kohm"}, "tolerance_percent": 5},
+                                                      "provenance": "explicit user input"}}]
+        self.assertTrue(validate_model(model)["topology_valid"])
+        model["components"][0]["electrical_model"]["parameters"]["resistance"]["unit"] = "V"
+        report = validate_model(model)
+        self.assertFalse(report["topology_valid"])
+        self.assertTrue(any("supported resistance unit" in error for error in report["errors"]))
+        model["components"][0]["electrical_model"]["kind"] = []
+        self.assertFalse(validate_model(model)["topology_valid"])
+
     def test_malformed_nested_values_fail_closed_without_type_errors(self):
         model = new_circuit_model()
         model["components"] = [{"reference": "R1", "value": "x", "symbol": None,
