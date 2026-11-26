@@ -5,6 +5,7 @@ from circuitmind.engineering import (
     capacitor_energy,
     capacitor_network,
     inductor_energy,
+    clock_timebase_error,
     led_series_resistor,
     ohms_law,
     rc_time_constant,
@@ -55,6 +56,42 @@ class ElectricalFundamentalTests(unittest.TestCase):
             lambda: rc_time_constant({"value": 1, "unit": "ohm"}, "not a quantity"),
         ]
         for calculate in cases:
+            with self.subTest(calculate=calculate), self.assertRaises(ValueError):
+                calculate()
+
+
+class ClockTimebaseTests(unittest.TestCase):
+    def test_symmetric_tolerance_becomes_signed_daily_and_long_term_drift(self):
+        result = clock_timebase_error({"value": 1, "unit": "Hz"}, {"value": 1, "unit": "Hz"}, 20)
+        output = result["outputs"]
+        self.assertAlmostEqual(output["nominal_rate_error"]["value"], 0)
+        self.assertAlmostEqual(output["minimum_clock_drift_per_day"]["value"], -1.728)
+        self.assertAlmostEqual(output["maximum_clock_drift_per_day"]["value"], 1.728)
+        self.assertAlmostEqual(output["maximum_clock_drift_per_30_days"]["value"], 51.84)
+        self.assertAlmostEqual(output["maximum_clock_drift_per_365_25_days"]["value"], 631.152)
+        self.assertIn("post-divider", " ".join(result["validity"]))
+        self.assertIn("digital simulation", result["warnings"][0])
+
+    def test_nominal_rate_offset_and_units_are_preserved(self):
+        result = clock_timebase_error({"value": 1.00001, "unit": "Hz"}, {"value": 1, "unit": "Hz"}, 20)
+        output = result["outputs"]
+        self.assertAlmostEqual(output["nominal_rate_error"]["value"], 10)
+        self.assertAlmostEqual(output["minimum_rate_error"]["value"], -10.0002, places=3)
+        self.assertAlmostEqual(output["maximum_rate_error"]["value"], 30.0002, places=3)
+        self.assertEqual(result["inputs"][0]["unit"], "Hz")
+        kHz = clock_timebase_error({"value": 1, "unit": "kHz"}, {"value": 1000, "unit": "Hz"}, 0)
+        self.assertAlmostEqual(kHz["outputs"]["nominal_rate_error"]["value"], 0)
+
+    def test_invalid_rate_tolerance_and_overflow_fail_closed(self):
+        invalid = [
+            lambda: clock_timebase_error({"value": 0, "unit": "Hz"}, {"value": 1, "unit": "Hz"}, 10),
+            lambda: clock_timebase_error({"value": 1, "unit": "A"}, {"value": 1, "unit": "Hz"}, 10),
+            lambda: clock_timebase_error({"value": 1, "unit": "Hz"}, {"value": 1, "unit": "Hz"}, -1),
+            lambda: clock_timebase_error({"value": 1, "unit": "Hz"}, {"value": 1, "unit": "Hz"}, 1_000_000),
+            lambda: clock_timebase_error({"value": 1, "unit": "Hz"}, {"value": 1, "unit": "Hz"}, True),
+            lambda: clock_timebase_error({"value": 1e308, "unit": "Hz"}, {"value": 1e-308, "unit": "Hz"}, 0),
+        ]
+        for calculate in invalid:
             with self.subTest(calculate=calculate), self.assertRaises(ValueError):
                 calculate()
 

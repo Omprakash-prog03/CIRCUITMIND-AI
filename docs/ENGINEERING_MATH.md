@@ -2,7 +2,7 @@
 
 ## Current implemented scope
 
-`circuitmind.engineering` is a pure-Python calculation library. It does not invoke ngspice or infer values from a component label. Its first project-linked workflow is a bounded DC LED-series-resistor analysis, accompanied by foundational Ohm's law, resistor/capacitor series-parallel networks, RC time constant, and ideal capacitor/inductor energy calculations.
+`circuitmind.engineering` is a pure-Python calculation library. It does not invoke ngspice or infer values from a component label. Project-linked workflows include a bounded DC LED-series-resistor analysis and a clock timebase rate-error budget, accompanied by foundational Ohm's law, resistor/capacitor series-parallel networks, RC time constant, and ideal capacitor/inductor energy calculations.
 
 Every quantity is entered as `{ "value": number, "unit": "..." }`. Supported input unit conversions are explicit and dimension-checked. Values are normalized to SI before calculation; result inputs retain original and SI values. NaN, infinity, booleans, unsupported unit spellings, wrong dimensions and nonpositive values where prohibited fail closed.
 
@@ -36,6 +36,12 @@ Input ranges must include their nominal values. If a current limit or power rati
 `POST /api/projects/<id>/calculations/led-resistor` runs this real calculation with explicit inputs. Optional `source_refs` values must identify components in the saved circuit model, but they are labels only: numerical values are not read from part descriptions or inferred from those references. The report stores both a canonical circuit-model SHA-256 and an input SHA-256.
 
 `GET /api/projects/<id>/calculations` compares each report's circuit hash with the current saved model and returns `current` or `stale`. A changed circuit does not relabel an old numerical result as current, and the tool does not silently rerun or modify the design. The user can rerun the calculation against the new revision. `current` means revision-hash match only, not engineering approval.
+
+## Clock timebase error budget
+
+`clock_timebase_error` and `POST /api/projects/<id>/calculations/clock-timebase` accept a user-entered nominal post-divider tick rate, target tick rate, and symmetric frequency tolerance in ppm. The report computes the nominal rate error, bounded actual rates, signed rate-error bounds, and accumulated drift bounds per day, 30 days, and 365.25 days. This helps state an explicit timing-accuracy budget for the digital-clock benchmark without assuming a crystal, NE555, MCU timer, divider, or part tolerance. Inputs are not obtained from a datasheet or circuit model; “current” in calculation history still means only that the saved-model hash matches.
+
+The model assumes a constant rate and a symmetric tolerance around the nominal rate. It excludes temperature dependence, aging, startup behavior, missed/extra ticks, calibration, and correction logic. It does not derive a divider ratio, instantiate digital logic, or run a simulation.
 
 ## Foundational functions
 

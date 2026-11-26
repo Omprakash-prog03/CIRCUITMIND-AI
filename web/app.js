@@ -49,7 +49,7 @@ function renderResult(project) {
   const artifactButtons = (project.artifacts || []).map((name) => name.endsWith('.raw') || name.endsWith('.pdf')
     ? `<a class="artifact-button" href="/api/projects/${encodeURIComponent(project.project_id)}/artifact/${encodeURIComponent(name)}" download>↓ &nbsp;Download ${escapeHtml(name)}</a>`
     : `<button class="artifact-button" data-artifact="${escapeHtml(name)}">↗ &nbsp;${escapeHtml(name)}</button>`).join('');
-  $('#view-result').innerHTML = `<div class="result-top"><div class="eyebrow"><span class="eyebrow-line"></span> ENGINEERING INTAKE COMPLETE</div><h1>${escapeHtml(project.name)}</h1><p>${escapeHtml(project.architecture)} architecture · Created ${escapeHtml(new Date(project.created_at).toLocaleString())}</p><div class="result-actions"><a class="primary-button" href="/api/projects/${encodeURIComponent(project.project_id)}/export"><span>Download project ZIP</span><span class="button-arrow">↓</span></a><button class="small-button" id="edit-circuit">Edit circuit model</button><button class="small-button" id="run-led-resistor-calculation">Analyze LED resistor</button><button class="small-button" id="import-schematic">Import KiCad schematic</button><button class="small-button" id="run-kicad-erc">Run KiCad ERC</button><button class="small-button" id="import-board">Import KiCad PCB</button><button class="small-button" id="run-kicad-drc">Run KiCad DRC</button><button class="small-button" id="import-datasheet">Import datasheet PDF</button><button class="small-button" id="extract-datasheet-text">Extract latest PDF text</button><button class="small-button" id="import-spice">Import SPICE deck</button><button class="small-button" id="run-ngspice">Run ngspice</button><button class="small-button" id="show-snapshots">Snapshots</button><button class="small-button" id="back-to-brief">← New analysis</button></div></div>
+  $('#view-result').innerHTML = `<div class="result-top"><div class="eyebrow"><span class="eyebrow-line"></span> ENGINEERING INTAKE COMPLETE</div><h1>${escapeHtml(project.name)}</h1><p>${escapeHtml(project.architecture)} architecture · Created ${escapeHtml(new Date(project.created_at).toLocaleString())}</p><div class="result-actions"><a class="primary-button" href="/api/projects/${encodeURIComponent(project.project_id)}/export"><span>Download project ZIP</span><span class="button-arrow">↓</span></a><button class="small-button" id="edit-circuit">Edit circuit model</button><button class="small-button" id="run-led-resistor-calculation">Analyze LED resistor</button><button class="small-button" id="run-clock-timebase-calculation">Analyze clock timebase</button><button class="small-button" id="import-schematic">Import KiCad schematic</button><button class="small-button" id="run-kicad-erc">Run KiCad ERC</button><button class="small-button" id="import-board">Import KiCad PCB</button><button class="small-button" id="run-kicad-drc">Run KiCad DRC</button><button class="small-button" id="import-datasheet">Import datasheet PDF</button><button class="small-button" id="extract-datasheet-text">Extract latest PDF text</button><button class="small-button" id="import-spice">Import SPICE deck</button><button class="small-button" id="run-ngspice">Run ngspice</button><button class="small-button" id="show-snapshots">Snapshots</button><button class="small-button" id="back-to-brief">← New analysis</button></div></div>
   <div class="status-banner">⚠ &nbsp; Incomplete — this is requirements and feasibility analysis, not a completed electrical design.</div>
   <div class="result-grid"><div><section class="result-panel"><h2>Feasibility findings <span class="optional">${findings.length} ITEMS</span></h2>${findings.map((finding) => `<div class="finding"><span class="finding-icon">!</span><span>${escapeHtml(finding)}</span></div>`).join('')}</section>
   <section class="result-panel"><h2>Supplied component inventory</h2>${inventoryRows ? `<table class="inventory-table"><thead><tr><th>PART / DESCRIPTION</th><th>QTY</th><th>VERIFICATION</th></tr></thead><tbody>${inventoryRows}</tbody></table>` : '<div class="empty-state">No inventory provided.</div>'}</section></div>
@@ -58,6 +58,7 @@ function renderResult(project) {
   $('#back-to-brief').addEventListener('click', () => showView('new'));
   $('#edit-circuit').addEventListener('click', openCircuitEditor);
   $('#run-led-resistor-calculation').addEventListener('click', openLedResistorCalculation);
+  $('#run-clock-timebase-calculation').addEventListener('click', openClockTimebaseCalculation);
   loadCalculationStatus(project.project_id);
   $('#import-schematic').addEventListener('click', () => $('#schematic-file').click());
   $('#run-kicad-erc').addEventListener('click', runKiCadErc);
@@ -107,6 +108,42 @@ function rangeInput(minId, maxId, unit, label) {
   if (minimum === null && maximum === null) return null;
   if (minimum === null || maximum === null) throw new Error(`Enter both ${label} minimum and maximum, or leave both blank`);
   return {min:{value:minimum, unit}, max:{value:maximum, unit}};
+}
+function openClockTimebaseCalculation() {
+  $('#clock-timebase-feedback').textContent = 'Enter a user-specified post-divider tick rate and symmetric tolerance. This does not infer an oscillator or divider.';
+  $('#clock-timebase-feedback').className = 'dialog-feedback';
+  $('#clock-timebase-dialog').showModal();
+}
+async function calculateClockTimebase(event) {
+  event.preventDefault();
+  const feedback = $('#clock-timebase-feedback');
+  try {
+    const inputs = {
+      nominal_tick_rate:{value:optionalNumber('calc-clock-nominal'), unit:'Hz'},
+      target_tick_rate:{value:optionalNumber('calc-clock-target'), unit:'Hz'},
+      tolerance_ppm:optionalNumber('calc-clock-tolerance'),
+    };
+    const response = await fetch(`/api/projects/${encodeURIComponent(currentProject.project_id)}/calculations/clock-timebase`, {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({inputs})
+    });
+    const report = await response.json();
+    if (!response.ok) throw new Error(report.error || `Calculation failed (${response.status})`);
+    const out = report.calculation.outputs;
+    const fmt = (quantity) => `${Number(quantity.value).toPrecision(6)} ${quantity.unit}`;
+    feedback.textContent = `${report.calculation.substitution}\nNominal rate error: ${fmt(out.nominal_rate_error)}\nRate-error bound: ${fmt(out.minimum_rate_error)} to ${fmt(out.maximum_rate_error)}\nClock drift/day: ${fmt(out.minimum_clock_drift_per_day)} to ${fmt(out.maximum_clock_drift_per_day)}\nClock drift/30 days: ${fmt(out.minimum_clock_drift_per_30_days)} to ${fmt(out.maximum_clock_drift_per_30_days)}\nClock drift/365.25 days: ${fmt(out.minimum_clock_drift_per_365_25_days)} to ${fmt(out.maximum_clock_drift_per_365_25_days)}\nBound to saved circuit SHA-256 ${report.circuit_model_sha256.slice(0,16)}…; report ${report.artifact}.\n${report.calculation.warnings.join(' ')}`;
+    feedback.className = 'dialog-feedback ok';
+    const projectId = currentProject.project_id;
+    await loadProjects();
+    currentProject = projectCache.find((project) => project.project_id === projectId) || currentProject;
+    await loadCalculationStatus(projectId);
+    const artifactList = $('#view-result .artifact-list');
+    if (artifactList && !artifactList.querySelector(`[data-artifact="${report.artifact}"]`)) {
+      const button = document.createElement('button'); button.className = 'artifact-button'; button.textContent = `↗  ${report.artifact}`;
+      button.addEventListener('click', () => openArtifact(projectId, report.artifact)); artifactList.append(button);
+    }
+  } catch (error) {
+    feedback.textContent = error.message; feedback.className = 'dialog-feedback error';
+  }
 }
 async function calculateLedResistor(event) {
   event.preventDefault();
@@ -395,6 +432,7 @@ $('#spice-file').addEventListener('change', (event) => {
   importSpiceFile(file);
 });
 $('#led-calc-form').addEventListener('submit', calculateLedResistor);
+$('#clock-timebase-form').addEventListener('submit', calculateClockTimebase);
 $('#circuit-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   try {

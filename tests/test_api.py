@@ -191,6 +191,36 @@ class CircuitApiTests(unittest.TestCase):
         self.assertIn("none was inferred", audit["components"][0]["reason"])
         self.assertEqual(audit["unresolved_count"], 1)
 
+    def test_clock_timebase_report_uses_explicit_rates_and_stales_with_model(self):
+        _, created = self.call("/api/projects", {"name": "Clock timebase budget", "description": "Analyze explicit one hertz post-divider rate", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        model = self.sample_design()
+        self.assertEqual(self.call(f"/api/projects/{project_id}/circuit", {"model": model}, "PUT")[0], 200)
+        inputs = {"nominal_tick_rate": {"value": 1, "unit": "Hz"},
+                  "target_tick_rate": {"value": 1, "unit": "Hz"}, "tolerance_ppm": 20}
+        code, report = self.call(f"/api/projects/{project_id}/calculations/clock-timebase", {"inputs": inputs}, "POST")
+        self.assertEqual(code, 201)
+        self.assertEqual(report["kind"], "clock_timebase_error")
+        self.assertAlmostEqual(report["calculation"]["outputs"]["maximum_clock_drift_per_day"]["value"], 1.728)
+        self.assertIn("no component specifications inferred", report["input_values_source"])
+        code, run_log = self.call(f"/api/projects/{project_id}/artifact/calculation_runs.jsonl")
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(run_log["content"].splitlines()[-1])["kind"], "clock_timebase_error")
+        code, history = self.call(f"/api/projects/{project_id}/calculations")
+        self.assertEqual(code, 200)
+        self.assertEqual(history["calculations"][-1]["kind"], "clock_timebase_error")
+        self.assertEqual(history["calculations"][-1]["status"], "current")
+        code, _ = self.call(f"/api/projects/{project_id}/calculations/clock-timebase", {
+            "inputs": {**inputs, "nominal_tick_rate": {"value": 1, "unit": "mA"}}}, "POST")
+        self.assertEqual(code, 422)
+        changed_model = dict(model)
+        changed_model["limitations"] = list(model["limitations"]) + ["Revised timebase analysis dependency"]
+        self.assertEqual(self.call(f"/api/projects/{project_id}/circuit", {"model": changed_model}, "PUT")[0], 200)
+        code, history = self.call(f"/api/projects/{project_id}/calculations")
+        self.assertEqual(code, 200)
+        clock_run = next(item for item in history["calculations"] if item["kind"] == "clock_timebase_error")
+        self.assertEqual(clock_run["status"], "stale")
+
     def test_led_calculation_is_revision_bound_and_marked_stale_after_model_edit(self):
         _, created = self.call("/api/projects", {"name": "LED resistor math", "description": "Calculate from explicit electrical inputs", "inventory": "", "architecture": "discrete"}, "POST")
         project_id = created["project_id"]
