@@ -28,6 +28,7 @@ _TOOLS = {
     "Arduino CLI": ("arduino-cli", ["version"]),
     "GCC": ("gcc", ["--version"]),
     "Clang": ("clang", ["--version"]),
+    "Poppler pdftotext": ("pdftotext", ["-v"]),
 }
 
 
@@ -341,3 +342,91 @@ def _first_group_int(match: re.Match[str] | None) -> int | None:
         if group is not None:
             return int(group)
     return None
+
+
+def run_pdftotext(project_dir: Path, source_sha256: str, timeout_seconds: float = 90.0) -> dict[str, Any]:
+    """Extract layout-preserving PDF text to page-delimited raw text, not claims."""
+    project_dir = project_dir.resolve()
+    started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+    if not re.fullmatch(r"[a-f0-9]{64}", source_sha256):
+        return {"tool": "Poppler pdftotext", "run_id": run_id, "started_at": started_at,
+                "status": "not-run", "reason": "Invalid datasheet source SHA-256 identifier."}
+    source = (project_dir / f"datasheet_{source_sha256}.pdf").resolve()
+    if source.parent != project_dir or not source.is_file():
+        return {"tool": "Poppler pdftotext", "run_id": run_id, "started_at": started_at,
+                "status": "not-run", "reason": "No attached datasheet with that SHA-256 exists."}
+    try:
+        if source.stat().st_size > 20_000_000:
+            raise ValueError("PDF exceeds the 20 MB extraction limit")
+        raw = source.read_bytes()
+        if not raw.startswith(b"%PDF-"):
+            raise ValueError("Source file does not begin with a PDF header")
+    except (OSError, ValueError) as exc:
+        return {"tool": "Poppler pdftotext", "run_id": run_id, "started_at": started_at,
+                "status": "not-run", "source_sha256": source_sha256,
+                "reason": f"Datasheet source could not be read: {exc}"}
+    actual_sha256 = hashlib.sha256(raw).hexdigest()
+    if actual_sha256 != source_sha256:
+        return {"tool": "Poppler pdftotext", "run_id": run_id, "started_at": started_at,
+                "status": "not-run", "source_sha256": source_sha256,
+                "reason": "Attached datasheet content no longer matches its recorded SHA-256."}
+    executable = shutil.which("pdftotext")
+    if not executable:
+        return {"tool": "Poppler pdftotext", "run_id": run_id, "started_at": started_at,
+                "status": "unavailable", "source_sha256": source_sha256,
+                "reason": "pdftotext was not found on PATH; no text extraction was run."}
+    executable = str(Path(executable).resolve())
+    with tempfile.TemporaryDirectory(prefix="circuitmind-pdf-text-", dir=project_dir) as temp_dir:
+        sandbox = Path(temp_dir)
+        home = sandbox / "home"
+        home.mkdir()
+        output_path = sandbox / "datasheet-text.txt"
+        env = {"PATH": os.environ.get("PATH", ""), "HOME": str(home), "TMP": str(sandbox),
+               "TEMP": str(sandbox), "TMPDIR": str(sandbox)}
+        command = [executable, "-layout", "-enc", "UTF-8", str(source), str(output_path)]
+        try:
+            exit_code, stdout, stderr = _run_bounded(command, sandbox, env, timeout_seconds)
+            extracted = ""
+            output_size = output_path.stat().st_size if output_path.is_file() else 0
+            if output_size > 8_000_000:
+                return {"tool": "Poppler pdftotext", "run_id": run_id, "started_at": started_at,
+                        "status": "failed-result-too-large", "exit_code": exit_code,
+                        "source_sha256": source_sha256, "text_size_bytes": output_size,
+                        "reason": "Extracted text exceeded the 8 MB limit and was discarded.",
+                        "stdout": stdout, "stderr": stderr}
+            if output_size:
+                extracted = output_path.read_bytes().decode("utf-8", errors="replace")
+            pages = extracted.split("\f")
+            if pages and not pages[-1].strip():
+                pages.pop()
+            page_count = len(pages)
+            page_linked_text = "\n\n".join(f"===== SOURCE PDF PAGE {index} =====\n{page.rstrip()}" for index, page in enumerate(pages, 1))
+            page_linked_size = len(page_linked_text.encode("utf-8"))
+            if page_linked_size > 8_000_000:
+                return {"tool": "Poppler pdftotext", "run_id": run_id, "started_at": started_at,
+                        "status": "failed-result-too-large", "exit_code": exit_code,
+                        "source_sha256": source_sha256, "text_size_bytes": page_linked_size,
+                        "reason": "Page-labelled extracted text exceeded the 8 MB limit and was discarded.",
+                        "stdout": stdout, "stderr": stderr}
+            if exit_code != 0:
+                status = "failed"
+            elif not extracted.strip():
+                status = "completed-empty"
+            else:
+                status = "completed"
+            return {"tool": "Poppler pdftotext", "run_id": run_id, "started_at": started_at,
+                    "status": status, "exit_code": exit_code, "source_sha256": source_sha256,
+                    "page_count": page_count, "text_size_bytes": output_size,
+                    "extracted_text": page_linked_text, "command": command,
+                    "stdout": stdout, "stderr": stderr,
+                    "interpretation": "Layout-preserving raw text extraction only. Text has not been interpreted, cross-checked, or converted into component specifications."}
+        except subprocess.TimeoutExpired as exc:
+            return {"tool": "Poppler pdftotext", "run_id": run_id, "started_at": started_at,
+                    "status": "timeout", "exit_code": None, "source_sha256": source_sha256,
+                    "reason": f"Text extraction exceeded {timeout_seconds:g} seconds; partial output is not retained.",
+                    "stdout": _as_text(exc.stdout)[-64_000:], "stderr": _as_text(exc.stderr)[-64_000:]}
+        except OSError as exc:
+            return {"tool": "Poppler pdftotext", "run_id": run_id, "started_at": started_at,
+                    "status": "failed-to-start", "exit_code": None, "source_sha256": source_sha256,
+                    "reason": f"Unable to start pdftotext: {exc}"}

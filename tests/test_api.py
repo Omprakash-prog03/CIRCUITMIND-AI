@@ -49,6 +49,18 @@ class CircuitApiTests(unittest.TestCase):
             body = response.read()
             return response.status, json.loads(body) if "json" in response.headers.get("Content-Type", "") else body
 
+    def call_raw(self, path, data, method="PUT", headers=None):
+        req = urllib.request.Request(self.base + path, data=data, method=method,
+                                     headers=headers or {"Content-Type": "application/pdf"})
+        try:
+            response = urllib.request.urlopen(req)
+        except urllib.error.HTTPError as exc:
+            body = exc.read()
+            return exc.code, json.loads(body) if "json" in exc.headers.get("Content-Type", "") else body
+        with response:
+            body = response.read()
+            return response.status, json.loads(body) if "json" in response.headers.get("Content-Type", "") else body
+
     def sample_design(self):
         pins = [{"number": "1", "name": "~", "type": "passive"}, {"number": "2", "name": "~", "type": "passive"}]
         return {"schema_version": 2, "metadata": {"units": "mm", "grid_mm": 1.27}, "status": "draft",
@@ -178,6 +190,38 @@ class CircuitApiTests(unittest.TestCase):
         self.assertEqual(audit["components"][0]["status"], "no-symbol-id")
         self.assertIn("none was inferred", audit["components"][0]["reason"])
         self.assertEqual(audit["unresolved_count"], 1)
+
+    def test_datasheet_pdf_is_hash_linked_downloadable_and_extraction_attempt_is_honest(self):
+        _, created = self.call("/api/projects", {"name": "Datasheet sources", "description": "Keep source evidence linked", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        model = self.sample_design()
+        code, _ = self.call(f"/api/projects/{project_id}/circuit", {"model": model}, "PUT")
+        self.assertEqual(code, 200)
+        pdf = b"%PDF-1.4\ncontrolled fixture only\n%%EOF\n"
+        code, uploaded = self.call_raw(f"/api/projects/{project_id}/datasheets?filename=clock%20datasheet.pdf&reference=R1", pdf)
+        self.assertEqual(code, 201)
+        self.assertEqual(uploaded["component_reference"], "R1")
+        self.assertEqual(len(uploaded["sha256"]), 64)
+        self.assertEqual(len(uploaded["circuit_model_sha256"]), 64)
+        self.assertIn("not run", uploaded["status"])
+        code, sources = self.call(f"/api/projects/{project_id}/datasheets")
+        self.assertEqual(code, 200)
+        self.assertEqual(sources["sources"][0]["sha256"], uploaded["sha256"])
+        code, downloaded = self.call(f"/api/projects/{project_id}/artifact/{uploaded['file']}")
+        self.assertEqual(code, 200)
+        self.assertEqual(downloaded, pdf)
+        code, bad_reference = self.call_raw(f"/api/projects/{project_id}/datasheets?filename=bad.pdf&reference=U99", pdf)
+        self.assertEqual(code, 422)
+        with patch.dict(os.environ, {"PATH": str(Path(self.temp.name) / "empty-path")}):
+            code, extraction = self.call(f"/api/projects/{project_id}/datasheets/{uploaded['sha256']}/extract", method="POST")
+        self.assertEqual(code, 200)
+        self.assertEqual(extraction["status"], "unavailable")
+        self.assertEqual(extraction["source_sha256"], uploaded["sha256"])
+        code, report = self.call(f"/api/projects/{project_id}/artifact/{extraction['report_file']}")
+        self.assertEqual(code, 200)
+        self.assertIn("unavailable", report["content"])
+        code, bad_header = self.call_raw(f"/api/projects/{project_id}/datasheets?filename=not-pdf.pdf", b"not a PDF")
+        self.assertEqual(code, 422)
 
     def test_spice_deck_import_requires_static_allowlist_and_simulation_is_logged(self):
         _, created = self.call("/api/projects", {"name": "SPICE API", "description": "RC transient test", "inventory": "", "architecture": "discrete"}, "POST")

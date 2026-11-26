@@ -46,10 +46,10 @@ function renderResult(project) {
   const checks = project.validation?.checks || {};
   const inventoryRows = (project.inventory || []).map((item) => `<tr><td>${escapeHtml(item.name)}</td><td>${escapeHtml(item.quantity ?? 'unspecified')}</td><td>Unverified</td></tr>`).join('');
   const statusLines = Object.entries(checks).map(([name, status]) => `<div class="validation-line"><span>${escapeHtml(name.replaceAll('_',' '))}</span><span>${escapeHtml(status)}</span></div>`).join('');
-  const artifactButtons = (project.artifacts || []).map((name) => name.endsWith('.raw')
+  const artifactButtons = (project.artifacts || []).map((name) => name.endsWith('.raw') || name.endsWith('.pdf')
     ? `<a class="artifact-button" href="/api/projects/${encodeURIComponent(project.project_id)}/artifact/${encodeURIComponent(name)}" download>↓ &nbsp;Download ${escapeHtml(name)}</a>`
     : `<button class="artifact-button" data-artifact="${escapeHtml(name)}">↗ &nbsp;${escapeHtml(name)}</button>`).join('');
-  $('#view-result').innerHTML = `<div class="result-top"><div class="eyebrow"><span class="eyebrow-line"></span> ENGINEERING INTAKE COMPLETE</div><h1>${escapeHtml(project.name)}</h1><p>${escapeHtml(project.architecture)} architecture · Created ${escapeHtml(new Date(project.created_at).toLocaleString())}</p><div class="result-actions"><a class="primary-button" href="/api/projects/${encodeURIComponent(project.project_id)}/export"><span>Download project ZIP</span><span class="button-arrow">↓</span></a><button class="small-button" id="edit-circuit">Edit circuit model</button><button class="small-button" id="import-schematic">Import KiCad schematic</button><button class="small-button" id="run-kicad-erc">Run KiCad ERC</button><button class="small-button" id="import-board">Import KiCad PCB</button><button class="small-button" id="run-kicad-drc">Run KiCad DRC</button><button class="small-button" id="import-spice">Import SPICE deck</button><button class="small-button" id="run-ngspice">Run ngspice</button><button class="small-button" id="show-snapshots">Snapshots</button><button class="small-button" id="back-to-brief">← New analysis</button></div></div>
+  $('#view-result').innerHTML = `<div class="result-top"><div class="eyebrow"><span class="eyebrow-line"></span> ENGINEERING INTAKE COMPLETE</div><h1>${escapeHtml(project.name)}</h1><p>${escapeHtml(project.architecture)} architecture · Created ${escapeHtml(new Date(project.created_at).toLocaleString())}</p><div class="result-actions"><a class="primary-button" href="/api/projects/${encodeURIComponent(project.project_id)}/export"><span>Download project ZIP</span><span class="button-arrow">↓</span></a><button class="small-button" id="edit-circuit">Edit circuit model</button><button class="small-button" id="import-schematic">Import KiCad schematic</button><button class="small-button" id="run-kicad-erc">Run KiCad ERC</button><button class="small-button" id="import-board">Import KiCad PCB</button><button class="small-button" id="run-kicad-drc">Run KiCad DRC</button><button class="small-button" id="import-datasheet">Import datasheet PDF</button><button class="small-button" id="extract-datasheet-text">Extract latest PDF text</button><button class="small-button" id="import-spice">Import SPICE deck</button><button class="small-button" id="run-ngspice">Run ngspice</button><button class="small-button" id="show-snapshots">Snapshots</button><button class="small-button" id="back-to-brief">← New analysis</button></div></div>
   <div class="status-banner">⚠ &nbsp; Incomplete — this is requirements and feasibility analysis, not a completed electrical design.</div>
   <div class="result-grid"><div><section class="result-panel"><h2>Feasibility findings <span class="optional">${findings.length} ITEMS</span></h2>${findings.map((finding) => `<div class="finding"><span class="finding-icon">!</span><span>${escapeHtml(finding)}</span></div>`).join('')}</section>
   <section class="result-panel"><h2>Supplied component inventory</h2>${inventoryRows ? `<table class="inventory-table"><thead><tr><th>PART / DESCRIPTION</th><th>QTY</th><th>VERIFICATION</th></tr></thead><tbody>${inventoryRows}</tbody></table>` : '<div class="empty-state">No inventory provided.</div>'}</section></div>
@@ -61,6 +61,8 @@ function renderResult(project) {
   $('#run-kicad-erc').addEventListener('click', runKiCadErc);
   $('#import-board').addEventListener('click', () => $('#board-file').click());
   $('#run-kicad-drc').addEventListener('click', runKiCadDrc);
+  $('#import-datasheet').addEventListener('click', () => $('#datasheet-file').click());
+  $('#extract-datasheet-text').addEventListener('click', extractLatestDatasheetText);
   $('#import-spice').addEventListener('click', () => $('#spice-file').click());
   $('#run-ngspice').addEventListener('click', runNgspice);
   $('#show-snapshots').addEventListener('click', showSnapshots);
@@ -196,6 +198,40 @@ async function importBoardFile(file) {
     toast('PCB board attached after a header check only. It has not been parsed, DRC-checked, or manufacturing validated.');
   } catch (error) { toast(error.message); }
 }
+async function importDatasheetFile(file) {
+  if (!file) return;
+  if (!file.name.toLowerCase().endsWith('.pdf')) { toast('Choose a PDF datasheet.'); return; }
+  if (file.size > 20_000_000) { toast('Datasheet PDF exceeds the 20 MB limit.'); return; }
+  const reference = window.prompt('Link this source to a saved circuit component reference (leave blank for unassigned):', '');
+  if (reference === null) return;
+  try {
+    const query = new URLSearchParams({filename: file.name});
+    if (reference.trim()) query.set('reference', reference.trim());
+    const response = await fetch(`/api/projects/${encodeURIComponent(currentProject.project_id)}/datasheets?${query}`, {
+      method: 'PUT', headers: {'Content-Type':'application/pdf'}, body: await file.arrayBuffer()
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `Datasheet upload failed (${response.status})`);
+    await refreshProject(currentProject.project_id);
+    toast(`Datasheet source attached (${result.sha256.slice(0,12)}…). PDF header only; no specifications extracted or verified.`);
+  } catch (error) { toast(error.message); }
+}
+async function extractLatestDatasheetText() {
+  if (!currentProject) return;
+  try {
+    const sources = (await (await request(`/api/projects/${encodeURIComponent(currentProject.project_id)}/datasheets`)).json()).sources || [];
+    const source = sources.at(-1);
+    if (!source) { toast('Attach a datasheet PDF first.'); return; }
+    const response = await fetch(`/api/projects/${encodeURIComponent(currentProject.project_id)}/datasheets/${source.sha256}/extract`, {method:'POST'});
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `Text extraction failed (${response.status})`);
+    await refreshProject(currentProject.project_id);
+    const detail = result.status === 'completed'
+      ? `Raw text extracted from ${result.page_count} page(s) into ${result.text_file}.`
+      : `PDF text extraction status: ${result.status}.`;
+    toast(`${detail} No component specifications or design claims were inferred.`);
+  } catch (error) { toast(error.message); }
+}
 async function runNgspice() {
   if (!currentProject) return;
   toast('Running local ngspice batch simulation…');
@@ -274,6 +310,10 @@ $('#schematic-file').addEventListener('change', (event) => {
 $('#board-file').addEventListener('change', (event) => {
   const file = event.target.files?.[0]; event.target.value = '';
   importBoardFile(file);
+});
+$('#datasheet-file').addEventListener('change', (event) => {
+  const file = event.target.files?.[0]; event.target.value = '';
+  importDatasheetFile(file);
 });
 $('#spice-file').addEventListener('change', (event) => {
   const file = event.target.files?.[0]; event.target.value = '';

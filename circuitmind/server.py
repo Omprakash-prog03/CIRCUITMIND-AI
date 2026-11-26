@@ -10,11 +10,11 @@ import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from . import __version__
 from .circuit_schema import export_kicad_netlist, migrate_model, validate_model
-from .integrations import discover_integrations, run_kicad_drc, run_kicad_erc, run_ngspice
+from .integrations import discover_integrations, run_kicad_drc, run_kicad_erc, run_ngspice, run_pdftotext
 from .kicad_symbols import resolve_kicad_symbol
 from .spice import validate_spice_deck
 from .models import ProjectInput
@@ -28,6 +28,7 @@ DATA_DIR = Path(os.environ.get("CIRCUITMIND_DATA_DIR", ROOT / "workspace")).expa
 MAX_BODY = 1_000_000
 MAX_SCHEMATIC_BODY = 24_000_000
 MAX_SCHEMATIC_FILE = 12_000_000
+MAX_DATASHEET_FILE = 20_000_000
 _CIRCUIT_API_LOCK = threading.RLock()
 _TOOL_LOCKS: dict[str, threading.Lock] = {}
 _TOOL_LOCKS_GUARD = threading.Lock()
@@ -74,6 +75,21 @@ class Handler(BaseHTTPRequestHandler):
                         continue
             return self._json(200, {"projects": records})
         parts = parsed.path.strip("/").split("/")
+        if len(parts) == 4 and parts[:2] == ["api", "projects"] and parts[3] == "datasheets":
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            sources_path = folder / "datasheet_sources.json"
+            if not sources_path.exists():
+                return self._json(200, {"sources": []})
+            try:
+                data = json.loads(sources_path.read_text("utf-8"))
+                return self._json(200, {"sources": data.get("sources", [])})
+            except (OSError, json.JSONDecodeError, AttributeError) as exc:
+                return self._json(500, {"error": f"Datasheet source index could not be read: {exc}"})
         if len(parts) == 4 and parts[0:2] == ["api", "projects"] and parts[3] in {"circuit", "snapshots"}:
             project_id = parts[2]
             if not _valid_id(project_id):
@@ -117,9 +133,9 @@ class Handler(BaseHTTPRequestHandler):
             if not _valid_id(project_id) or filename not in _allowed_artifacts(project_id):
                 return self._json(404, {"error": "Artifact not found"})
             payload = (DATA_DIR / "projects" / project_id / filename).read_bytes()
-            if filename.endswith(".raw"):
+            if filename.endswith((".raw", ".pdf")):
                 self.send_response(200)
-                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Type", "application/pdf" if filename.endswith(".pdf") else "application/octet-stream")
                 self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
@@ -155,6 +171,39 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         parts = path.strip("/").split("/")
+        if len(parts) == 6 and parts[:2] == ["api", "projects"] and parts[3] == "datasheets" and parts[5] == "extract":
+            project_id, source_sha256 = parts[2], parts[4]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            with _project_tool_lock(project_id):
+                result = run_pdftotext(folder, source_sha256)
+                sources_path = folder / "datasheet_sources.json"
+                if sources_path.is_file():
+                    try:
+                        sources = json.loads(sources_path.read_text("utf-8")).get("sources", [])
+                        source_record = next((item for item in reversed(sources) if item.get("sha256") == source_sha256), None)
+                        if source_record:
+                            result["source_id"] = source_record.get("source_id")
+                            result["source_filename"] = source_record.get("filename")
+                            result["component_reference"] = source_record.get("component_reference")
+                            result["circuit_model_sha256"] = source_record.get("circuit_model_sha256")
+                    except (OSError, json.JSONDecodeError, AttributeError, TypeError):
+                        pass
+                extracted = result.pop("extracted_text", "")
+                if extracted:
+                    text_name = f"datasheet_text_{result['run_id']}.txt"
+                    _atomic_bytes(folder / text_name, extracted.encode("utf-8"))
+                    result["text_file"] = text_name
+                report_name = f"datasheet_extraction_{result['run_id']}.json"
+                result["report_file"] = report_name
+                with _CIRCUIT_API_LOCK:
+                    _append_tool_run(folder, result)
+                    _atomic_bytes(folder / report_name, (json.dumps(result, indent=2, ensure_ascii=False) + "\n").encode())
+                    _update_project_record(folder)
+            return self._json(200, result)
         if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["integrations", "ngspice"]:
             project_id = parts[2]
             if not _valid_id(project_id):
@@ -358,7 +407,73 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(500, {"error": f"Unable to save project: {exc}"})
 
     def do_PUT(self) -> None:
-        parts = urlparse(self.path).path.strip("/").split("/")
+        parsed = urlparse(self.path)
+        parts = parsed.path.strip("/").split("/")
+        if len(parts) == 4 and parts[:2] == ["api", "projects"] and parts[3] == "datasheets":
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            raw_filename = (query.get("filename") or ["datasheet.pdf"])[0]
+            filename = raw_filename.replace("\\", "/").split("/")[-1].strip()
+            reference = (query.get("reference") or [""])[0].strip()
+            if not filename or len(filename) > 180 or any(ord(char) < 32 for char in filename) or not filename.lower().endswith(".pdf"):
+                return self._json(422, {"error": "Datasheet upload requires a .pdf filename (maximum 180 characters)"})
+            if len(reference) > 24:
+                return self._json(422, {"error": "Component reference is too long"})
+            circuit_model_sha256 = None
+            if reference:
+                try:
+                    model = load_circuit(folder)
+                except (OSError, json.JSONDecodeError, ValueError) as exc:
+                    return self._json(500, {"error": f"Circuit model could not be loaded for source linking: {exc}"})
+                if reference not in {component.get("reference") for component in model.get("components", [])}:
+                    return self._json(422, {"error": f"Reference {reference} is not a component in the saved circuit model"})
+                circuit_model_sha256 = hashlib.sha256(json.dumps(model, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+            if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/pdf":
+                return self._json(415, {"error": "Datasheet body must use Content-Type application/pdf"})
+            try:
+                raw = self._read_raw_body(MAX_DATASHEET_FILE)
+                if not raw.startswith(b"%PDF-"):
+                    return self._json(422, {"error": "Datasheet upload is not marked with a PDF header"})
+                source_sha256 = hashlib.sha256(raw).hexdigest()
+                target_name = f"datasheet_{source_sha256}.pdf"
+                run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+                imported_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                item = {"source_id": run_id, "filename": filename, "file": target_name,
+                        "component_reference": reference or None, "circuit_model_sha256": circuit_model_sha256,
+                        "sha256": source_sha256, "size_bytes": len(raw), "imported_at": imported_at,
+                        "status": "attached; PDF header checked only; text extraction not run"}
+                report_name = f"datasheet_import_{run_id}.json"
+                item["import_report"] = report_name
+                with _project_tool_lock(project_id):
+                    target = folder / target_name
+                    if target.exists() and hashlib.sha256(target.read_bytes()).hexdigest() != source_sha256:
+                        return self._json(409, {"error": "Stored datasheet hash path does not match its file contents"})
+                    if not target.exists():
+                        _atomic_bytes(target, raw)
+                    index_path = folder / "datasheet_sources.json"
+                    if index_path.exists():
+                        index = json.loads(index_path.read_text("utf-8"))
+                        if not isinstance(index, dict) or not isinstance(index.get("sources"), list):
+                            return self._json(500, {"error": "Datasheet source index has an unsupported format"})
+                    else:
+                        index = {"schema_version": 1, "sources": []}
+                    index["sources"].append(item)
+                    with _CIRCUIT_API_LOCK:
+                        _atomic_bytes(index_path, (json.dumps(index, indent=2, ensure_ascii=False) + "\n").encode())
+                        _atomic_bytes(folder / report_name, (json.dumps(item, indent=2, ensure_ascii=False) + "\n").encode())
+                        _update_project_record(folder)
+                return self._json(201, item)
+            except RequestTooLarge as exc:
+                return self._json(413, {"error": str(exc)})
+            except ValueError as exc:
+                return self._json(400, {"error": str(exc)})
+            except (OSError, json.JSONDecodeError) as exc:
+                return self._json(500, {"error": f"Unable to attach datasheet: {exc}"})
         if len(parts) == 4 and parts[:2] == ["api", "projects"] and parts[3] in {"schematic", "simulation-deck", "board"}:
             project_id = parts[2]
             is_schematic = parts[3] == "schematic"
@@ -447,6 +562,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": str(exc)})
         except OSError as exc:
             return self._json(500, {"error": f"Unable to save circuit model: {exc}"})
+
+    def _read_raw_body(self, max_bytes: int) -> bytes:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ValueError("Invalid Content-Length") from exc
+        if length <= 0:
+            raise ValueError("Request body must not be empty")
+        if length > max_bytes:
+            raise RequestTooLarge(f"Request exceeds the {max_bytes}-byte limit")
+        body = self.rfile.read(length)
+        if len(body) != length:
+            raise ValueError("Request body ended before Content-Length bytes were received")
+        return body
 
     def _read_payload(self, max_bytes: int = MAX_BODY) -> dict[str, object]:
         try:

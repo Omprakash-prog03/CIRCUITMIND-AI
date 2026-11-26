@@ -14,6 +14,13 @@
 3. Outcomes include `unavailable`, `not-run`, `timeout`, `failed`, `failed-to-start`, `completed-unparsed`, `completed-with-violations`, and `completed-no-reported-violations`. A zero exit is not clean by itself: the report must include explicit counts for both DRC violations and unconnected pads, and both must be zero for the no-reported-violations status.
 4. This status reflects only KiCad's report for the imported board. It does not establish electrical design correctness, successful fabrication, manufacturing-rule suitability, assembly quality, or hardware operation. Review the report and confirm board-specific constraints separately.
 
+## Datasheet PDF source intake and text extraction
+
+1. Use **Import datasheet PDF** or send a raw PDF body to `PUT /api/projects/<id>/datasheets?filename=<name.pdf>&reference=<saved-ref>` with `Content-Type: application/pdf`. The source must begin with `%PDF-` and fit within 20 MB. The endpoint records SHA-256, size, original filename, and import timestamp; it stores one content-addressed PDF and an append-only source record. An optional component reference must already exist in the saved circuit model; the associated model SHA-256 is recorded. This is a header check, not PDF validation.
+2. `GET /api/projects/<id>/datasheets` lists source records. PDF files are downloadable project artifacts; duplicate byte-identical uploads reuse the same stored PDF while retaining separate source records/associations.
+3. **Extract latest PDF text** requests `POST /api/projects/<id>/datasheets/<sha256>/extract`. If `pdftotext` is installed, the adapter executes fixed argv with a 90-second timeout in a project-local temporary directory and captures bounded process output. Extracted text is limited to 8 MB and saved with explicit `SOURCE PDF PAGE n` delimiters; the report references the original SHA-256 and page count. `GET /api/integrations` probes `pdftotext -v` only.
+4. Extraction is only text transcription. It does not interpret tables, cross-check variants or errata, identify trusted component ratings, or populate pinouts/design requirements. Scanned/image-only pages may yield no text. No real PDF extraction was run in this environment; adapter tests use a controlled temporary executable. PDF parsers are native local processes and not security sandboxes; use trusted datasheets.
+
 ## Installed KiCad symbol audit (read-only)
 
 1. In the circuit editor, choose **Audit installed symbols**. The UI sends the current draft to `POST /api/projects/<id>/circuit/symbols/resolve` as JSON `{ "model": ... }`; the stored model is not replaced or saved by this operation.
@@ -34,4 +41,4 @@ Native tool adapters use fixed commands without a shell, wall-clock timeouts, bo
 
 ## Other tool status
 
-`GET /api/integrations` only probes executable availability/version. It runs no ERC, DRC, simulation, or compilation. This workspace has neither `kicad-cli` nor `ngspice`, so no real ERC, DRC, or simulation has been performed here. Adapter regression tests use temporary controlled executables to verify argv, timeout, output capture, and status interpretation; they are not real engineering-tool results. PlatformIO, Arduino CLI build, firmware compilation, and other integrations remain pending.
+`GET /api/integrations` only probes executable availability/version. It runs no ERC, DRC, simulation, datasheet extraction, or compilation. This workspace has neither `kicad-cli` nor `ngspice`, so no real ERC, DRC, or simulation has been performed here. Adapter regression tests use temporary controlled executables to verify argv, timeout, output capture, and status interpretation; they are not real engineering-tool results. PlatformIO, Arduino CLI build, firmware compilation, and other integrations remain pending.
