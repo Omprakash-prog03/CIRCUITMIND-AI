@@ -16,7 +16,7 @@ from . import __version__
 from .circuit_schema import export_kicad_netlist, migrate_model, validate_model
 from .integrations import discover_integrations, run_kicad_drc, run_kicad_erc, run_ngspice, run_pdftotext
 from .kicad_symbols import resolve_kicad_symbol
-from .engineering import clock_divider_candidate, clock_timebase_error, led_series_resistor, solve_dc_operating_point
+from .engineering import clock_divider_candidate, clock_timebase_error, led_series_resistor, solve_dc_operating_point, map_circuit_graph_to_mna
 from .spice import validate_spice_deck
 from .models import ProjectInput
 from .project_store import list_snapshots, load_circuit, restore_snapshot, save_circuit
@@ -115,17 +115,27 @@ class Handler(BaseHTTPRequestHandler):
                 runs = []
                 for report_path in folder.glob("simulation_mna_*.json"):
                     report = json.loads(report_path.read_text("utf-8"))
-                    netlist = report.get("input_netlist")
+                    netlist = report.get("input_netlist", report.get("generated_netlist"))
                     recorded_netlist_hash = report.get("netlist_sha256")
                     if not isinstance(netlist, dict):
                         netlist_status = "missing-netlist"
                     else:
                         actual_netlist_hash = hashlib.sha256(json.dumps(netlist, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
                         netlist_status = "intact" if actual_netlist_hash == recorded_netlist_hash else "hash-mismatch"
+                    input_mapping = report.get("input_mapping")
+                    recorded_mapping_hash = report.get("mapping_sha256")
+                    if recorded_mapping_hash is None:
+                        mapping_status = "not-applicable"
+                    elif not isinstance(input_mapping, dict):
+                        mapping_status = "missing-mapping"
+                    else:
+                        actual_mapping_hash = hashlib.sha256(json.dumps(input_mapping, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+                        mapping_status = "intact" if actual_mapping_hash == recorded_mapping_hash else "hash-mismatch"
                     runs.append({"run_id": report.get("run_id"), "kind": report.get("kind"),
                                  "created_at": report.get("created_at"), "artifact": report_path.name,
                                  "model_status": "same-at-run" if report.get("circuit_model_sha256") == current_hash else "model-changed-since-run",
                                  "netlist_status": netlist_status, "netlist_sha256": recorded_netlist_hash,
+                                 "mapping_status": mapping_status,
                                  "circuit_model_sha256": report.get("circuit_model_sha256"),
                                  "outputs": report.get("calculation", {}).get("outputs", {})})
                 runs.sort(key=lambda item: (item.get("created_at", ""), item.get("run_id", "")))
@@ -228,6 +238,57 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         parts = path.strip("/").split("/")
+        if len(parts) == 6 and parts[:2] == ["api", "projects"] and parts[3:] == ["simulations", "dc-operating-point", "from-model"]:
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            try:
+                payload = self._read_payload(200_000)
+                mapping = payload.get("mapping")
+                if not isinstance(mapping, dict):
+                    raise ValueError("Request must include an explicit 'mapping' object")
+                with _project_tool_lock(project_id), _CIRCUIT_API_LOCK:
+                    model = load_circuit(folder)
+                    topology = validate_model(model)
+                    if not topology["topology_valid"]:
+                        return self._json(409, {"error": "Saved circuit model failed schema/topology checks", "topology_report": topology})
+                    resolved = map_circuit_graph_to_mna(model, mapping)
+                    calculation = solve_dc_operating_point(resolved["netlist"])
+                    calculation["warnings"][1] = "Netlist topology derives from saved graph nets; component type, ordered pins, and numeric values are explicit user mappings, not datasheet-verified."
+                    if resolved["excluded_components"]:
+                        calculation["warnings"].append("Excluded components were omitted; this is a partial model of the saved circuit graph.")
+                    calculation["scope"] = "Numerical linear DC operating-point solution built from saved graph connectivity plus explicit user type/value/pin mappings; not nonlinear/transient simulation or datasheet approval."
+                    model_hash = hashlib.sha256(json.dumps(model, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+                    mapping_hash = hashlib.sha256(json.dumps(mapping, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+                    netlist = resolved["netlist"]
+                    netlist_hash = hashlib.sha256(json.dumps(netlist, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+                    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+                    report_name = f"simulation_mna_{run_id}.json"
+                    created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    report = {"run_id": run_id, "kind": "circuit_graph_bound_linear_dc_mna_operating_point", "created_at": created_at,
+                              "circuit_model_sha256": model_hash, "mapping_sha256": mapping_hash, "netlist_sha256": netlist_hash,
+                              "input_mapping": mapping, "mapping_report": resolved,
+                              "component_coverage": resolved["component_coverage"],
+                              "input_values_source": "explicit user-supplied element types, values, terminal order, ground net, and exclusions; graph connectivity is read from saved model",
+                              "calculation": calculation, "generated_netlist": netlist, "artifact": report_name}
+                    _atomic_bytes(folder / report_name, (json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode())
+                    with (folder / "simulation_runs.jsonl").open("a", encoding="utf-8") as log:
+                        log.write(json.dumps({"run_id": run_id, "kind": report["kind"], "created_at": created_at,
+                                              "circuit_model_sha256": model_hash, "mapping_sha256": mapping_hash,
+                                              "netlist_sha256": netlist_hash, "artifact": report_name}, ensure_ascii=False, allow_nan=False) + "\n")
+                        log.flush()
+                        os.fsync(log.fileno())
+                    _update_project_record(folder)
+                return self._json(201, report)
+            except RequestTooLarge as exc:
+                return self._json(413, {"error": str(exc)})
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+                return self._json(422, {"error": str(exc)})
+            except OSError as exc:
+                return self._json(500, {"error": f"Graph-bound MNA report could not be stored: {exc}"})
         if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["simulations", "dc-operating-point"]:
             project_id = parts[2]
             if not _valid_id(project_id):

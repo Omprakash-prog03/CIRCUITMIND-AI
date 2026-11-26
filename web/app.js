@@ -49,7 +49,7 @@ function renderResult(project) {
   const artifactButtons = (project.artifacts || []).map((name) => name.endsWith('.raw') || name.endsWith('.pdf')
     ? `<a class="artifact-button" href="/api/projects/${encodeURIComponent(project.project_id)}/artifact/${encodeURIComponent(name)}" download>↓ &nbsp;Download ${escapeHtml(name)}</a>`
     : `<button class="artifact-button" data-artifact="${escapeHtml(name)}">↗ &nbsp;${escapeHtml(name)}</button>`).join('');
-  $('#view-result').innerHTML = `<div class="result-top"><div class="eyebrow"><span class="eyebrow-line"></span> ENGINEERING INTAKE COMPLETE</div><h1>${escapeHtml(project.name)}</h1><p>${escapeHtml(project.architecture)} architecture · Created ${escapeHtml(new Date(project.created_at).toLocaleString())}</p><div class="result-actions"><a class="primary-button" href="/api/projects/${encodeURIComponent(project.project_id)}/export"><span>Download project ZIP</span><span class="button-arrow">↓</span></a><button class="small-button" id="edit-circuit">Edit circuit model</button><button class="small-button" id="run-led-resistor-calculation">Analyze LED resistor</button><button class="small-button" id="run-clock-timebase-calculation">Analyze clock timebase</button><button class="small-button" id="run-clock-divider-calculation">Find divider candidate</button><button class="small-button" id="run-dc-mna">Solve linear DC MNA</button><button class="small-button" id="import-schematic">Import KiCad schematic</button><button class="small-button" id="run-kicad-erc">Run KiCad ERC</button><button class="small-button" id="import-board">Import KiCad PCB</button><button class="small-button" id="run-kicad-drc">Run KiCad DRC</button><button class="small-button" id="import-datasheet">Import datasheet PDF</button><button class="small-button" id="extract-datasheet-text">Extract latest PDF text</button><button class="small-button" id="import-spice">Import SPICE deck</button><button class="small-button" id="run-ngspice">Run ngspice</button><button class="small-button" id="show-snapshots">Snapshots</button><button class="small-button" id="back-to-brief">← New analysis</button></div></div>
+  $('#view-result').innerHTML = `<div class="result-top"><div class="eyebrow"><span class="eyebrow-line"></span> ENGINEERING INTAKE COMPLETE</div><h1>${escapeHtml(project.name)}</h1><p>${escapeHtml(project.architecture)} architecture · Created ${escapeHtml(new Date(project.created_at).toLocaleString())}</p><div class="result-actions"><a class="primary-button" href="/api/projects/${encodeURIComponent(project.project_id)}/export"><span>Download project ZIP</span><span class="button-arrow">↓</span></a><button class="small-button" id="edit-circuit">Edit circuit model</button><button class="small-button" id="run-led-resistor-calculation">Analyze LED resistor</button><button class="small-button" id="run-clock-timebase-calculation">Analyze clock timebase</button><button class="small-button" id="run-clock-divider-calculation">Find divider candidate</button><button class="small-button" id="run-dc-mna">Solve explicit linear DC MNA</button><button class="small-button" id="run-graph-mna">Map graph to MNA</button><button class="small-button" id="import-schematic">Import KiCad schematic</button><button class="small-button" id="run-kicad-erc">Run KiCad ERC</button><button class="small-button" id="import-board">Import KiCad PCB</button><button class="small-button" id="run-kicad-drc">Run KiCad DRC</button><button class="small-button" id="import-datasheet">Import datasheet PDF</button><button class="small-button" id="extract-datasheet-text">Extract latest PDF text</button><button class="small-button" id="import-spice">Import SPICE deck</button><button class="small-button" id="run-ngspice">Run ngspice</button><button class="small-button" id="show-snapshots">Snapshots</button><button class="small-button" id="back-to-brief">← New analysis</button></div></div>
   <div class="status-banner">⚠ &nbsp; Incomplete — this is requirements and feasibility analysis, not a completed electrical design.</div>
   <div class="result-grid"><div><section class="result-panel"><h2>Feasibility findings <span class="optional">${findings.length} ITEMS</span></h2>${findings.map((finding) => `<div class="finding"><span class="finding-icon">!</span><span>${escapeHtml(finding)}</span></div>`).join('')}</section>
   <section class="result-panel"><h2>Supplied component inventory</h2>${inventoryRows ? `<table class="inventory-table"><thead><tr><th>PART / DESCRIPTION</th><th>QTY</th><th>VERIFICATION</th></tr></thead><tbody>${inventoryRows}</tbody></table>` : '<div class="empty-state">No inventory provided.</div>'}</section></div>
@@ -61,6 +61,7 @@ function renderResult(project) {
   $('#run-clock-timebase-calculation').addEventListener('click', openClockTimebaseCalculation);
   $('#run-clock-divider-calculation').addEventListener('click', openClockDividerCalculation);
   $('#run-dc-mna').addEventListener('click', openMnaDialog);
+  $('#run-graph-mna').addEventListener('click', openGraphMnaDialog);
   loadCalculationStatus(project.project_id);
   loadSimulationStatus(project.project_id);
   $('#import-schematic').addEventListener('click', () => $('#schematic-file').click());
@@ -118,7 +119,7 @@ async function loadSimulationStatus(projectId) {
   try {
     const data = await (await request(`/api/projects/${encodeURIComponent(projectId)}/simulations`)).json();
     if (!data.simulations?.length) { node.innerHTML = '<div class="empty-state">No linear DC MNA runs have been saved.</div>'; return; }
-    node.innerHTML = [...data.simulations].reverse().map((run) => `<div class="validation-line"><span>${escapeHtml(run.kind.replaceAll('_',' '))}</span><span class="calc-state ${run.model_status === 'same-at-run' && run.netlist_status === 'intact' ? 'current' : 'stale'}">${escapeHtml(run.model_status)} · netlist ${escapeHtml(run.netlist_status)} · ${escapeHtml(new Date(run.created_at).toLocaleString())}</span></div>`).join('');
+    node.innerHTML = [...data.simulations].reverse().map((run) => `<div class="validation-line"><span>${escapeHtml(run.kind.replaceAll('_',' '))}</span><span class="calc-state ${run.model_status === 'same-at-run' && run.netlist_status === 'intact' ? 'current' : 'stale'}">${escapeHtml(run.model_status)} · netlist ${escapeHtml(run.netlist_status)} · map ${escapeHtml(run.mapping_status)} · ${escapeHtml(new Date(run.created_at).toLocaleString())}</span></div>`).join('');
   } catch (error) { node.textContent = `Simulation history unavailable: ${error.message}`; }
 }
 function openMnaDialog() {
@@ -142,6 +143,39 @@ async function runMna(event) {
     feedback.textContent = `Solver state: ${out.solver_status}\nNode voltages:\n${nodeRows}\nElement results (positive power is absorbed):\n${elementRows}\nPower balance: ${Number(out.total_power_balance.value).toExponential(4)} W · normalized equation residual: ${Number(out.normalized_equation_residual).toExponential(3)}\n${report.calculation.warnings.join(' ')}\nSaved as ${report.artifact}; netlist SHA-256 ${report.netlist_sha256.slice(0,16)}…`;
     feedback.className = 'dialog-feedback ok';
     const projectId = currentProject.project_id;
+    await loadProjects();
+    currentProject = projectCache.find((project) => project.project_id === projectId) || currentProject;
+    await loadSimulationStatus(projectId);
+    const artifactList = $('#view-result .artifact-list');
+    if (artifactList && !artifactList.querySelector(`[data-artifact="${report.artifact}"]`)) {
+      const button = document.createElement('button'); button.className = 'artifact-button'; button.textContent = `↗  ${report.artifact}`;
+      button.addEventListener('click', () => openArtifact(projectId, report.artifact)); artifactList.append(button);
+    }
+  } catch (error) {
+    feedback.textContent = error.message; feedback.className = 'dialog-feedback error';
+  }
+}
+function openGraphMnaDialog() {
+  $('#graph-mna-feedback').textContent = 'Specify every saved component exactly once: map it to an explicit R/V/I type, ordered pair of declared pins, and typed numeric value, or exclude it with a reason. No component descriptions are parsed.';
+  $('#graph-mna-feedback').className = 'dialog-feedback';
+  $('#graph-mna-dialog').showModal();
+}
+async function runGraphMna(event) {
+  event.preventDefault();
+  const feedback = $('#graph-mna-feedback');
+  try {
+    const mapping = JSON.parse($('#graph-mna-mapping').value);
+    const projectId = currentProject.project_id;
+    const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/simulations/dc-operating-point/from-model`, {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({mapping})
+    });
+    const report = await response.json();
+    if (!response.ok) throw new Error(report.error || `Graph mapping/MNA failed (${response.status})`);
+    const out = report.calculation.outputs;
+    const nodeRows = Object.entries(report.mapping_report.net_name_to_solver_node).map(([name, node]) => `${name} (${node}): ${Number(out.node_voltages[node].value).toPrecision(7)} V`).join('\n');
+    const componentRows = report.component_coverage;
+    feedback.textContent = `Solver state: ${out.solver_status}\nNodes derived from saved graph:\n${nodeRows}\nComponents accounted: ${componentRows.mapped} mapped, ${componentRows.excluded} explicitly excluded of ${componentRows.total}.\nExclusions: ${report.mapping_report.excluded_components.map((item) => `${item.reference}: ${item.reason}`).join('; ') || 'none'}\nPower balance: ${Number(out.total_power_balance.value).toExponential(4)} W · normalized equation residual: ${Number(out.normalized_equation_residual).toExponential(3)}\n${report.calculation.warnings.join(' ')}\nMapping SHA-256 ${report.mapping_sha256.slice(0,16)}…; saved ${report.artifact}.`;
+    feedback.className = componentRows.has_exclusions ? 'dialog-feedback' : 'dialog-feedback ok';
     await loadProjects();
     currentProject = projectCache.find((project) => project.project_id === projectId) || currentProject;
     await loadSimulationStatus(projectId);
@@ -516,6 +550,7 @@ $('#led-calc-form').addEventListener('submit', calculateLedResistor);
 $('#clock-timebase-form').addEventListener('submit', calculateClockTimebase);
 $('#clock-divider-form').addEventListener('submit', calculateClockDivider);
 $('#mna-form').addEventListener('submit', runMna);
+$('#graph-mna-form').addEventListener('submit', runGraphMna);
 $('#circuit-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   try {

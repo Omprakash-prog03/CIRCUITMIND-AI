@@ -49,6 +49,8 @@ If the requested output exceeds the source frequency, integer division cannot up
 
 The JSON netlist has an explicit ground label and two-terminal elements with typed quantities. Current-source direction follows the listed terminal order; voltage-source voltage is terminal zero minus terminal one. The implementation is bounded to 500 elements, 150 non-ground nodes and 180 MNA unknowns. It rejects unsupported and malformed entries rather than guessing device models.
 
+A graph-bound endpoint, `POST /api/projects/<id>/simulations/dc-operating-point/from-model`, uses saved graph connectivity but still requires an explicit mapping for every component: supported R/V/I type, both declared pin numbers in order, and a typed numeric value; otherwise a component must be explicitly excluded with a reason. It does not parse the component's description, symbol ID, or datasheet. The report retains the model hash, mapping hash, generated netlist hash, net-to-solver-node table, mapped/excluded lists, and residuals. “All components accounted for” means only that each was mapped or explicitly excluded—not that the electrical model is complete or physically correct. Exclusions are omitted from the solve and visibly warn that it is partial.
+
 This is a real numerical **linear DC operating-point solve**, not a transient simulation, nonlinear SPICE run, or result from ngspice. Capacitors/inductors, dependent sources, semiconductor models, tolerances, temperature, parasitics, and transient behavior are unsupported. The user-supplied netlist is hash-recorded but is not generated from or compared with the saved circuit graph. A model edit is shown separately from netlist integrity; it does not claim that the netlist changed or rerun it.
 
 ## Clock timebase error budget

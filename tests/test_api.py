@@ -72,6 +72,19 @@ class CircuitApiTests(unittest.TestCase):
                          {"name": "B", "terminals": [{"reference": "R1", "pin": "2"}, {"reference": "R2", "pin": "2"}]}],
                 "inventory": [], "limitations": []}
 
+    def mna_design(self):
+        pins = [{"number": "1", "name": "A", "type": "passive"}, {"number": "2", "name": "B", "type": "passive"}]
+        components = []
+        for reference, description, x in (("V1", "unverified source", 10), ("R1", "10k description", 20), ("R2", "10k description", 30)):
+            components.append({"reference": reference, "value": description, "symbol": None, "footprint": None,
+                               "datasheet": None, "pins": pins, "position_mm": {"x": x, "y": 10}, "rotation_deg": 0})
+        return {"schema_version": 2, "metadata": {"units": "mm", "grid_mm": 1.27}, "status": "draft",
+                "components": components,
+                "nets": [{"name": "VIN", "terminals": [{"reference": "V1", "pin": "1"}, {"reference": "R1", "pin": "1"}]},
+                         {"name": "MID", "terminals": [{"reference": "R1", "pin": "2"}, {"reference": "R2", "pin": "1"}]},
+                         {"name": "GND", "terminals": [{"reference": "V1", "pin": "2"}, {"reference": "R2", "pin": "2"}]}],
+                "inventory": [], "limitations": []}
+
     def test_end_to_end_create_validate_save_export_snapshot_restore(self):
         code, created = self.call("/api/projects", {"name": "API clock", "description": "Clock with alarm", "inventory": "CD4511 × 3", "architecture": "discrete"}, "POST")
         self.assertEqual(code, 201)
@@ -190,6 +203,43 @@ class CircuitApiTests(unittest.TestCase):
         self.assertEqual(audit["components"][0]["status"], "no-symbol-id")
         self.assertIn("none was inferred", audit["components"][0]["reason"])
         self.assertEqual(audit["unresolved_count"], 1)
+
+    def test_graph_bound_mna_requires_explicit_complete_component_mapping(self):
+        _, created = self.call("/api/projects", {"name": "Graph-bound MNA", "description": "Explicit net mapping", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        model = self.mna_design()
+        self.assertEqual(self.call(f"/api/projects/{project_id}/circuit", {"model": model}, "PUT")[0], 200)
+        mapping = {"ground_net": "GND", "bindings": [
+            {"reference": "V1", "type": "voltage_source", "pins": ["1", "2"], "value": {"value": 5, "unit": "V"}},
+            {"reference": "R1", "type": "resistor", "pins": ["1", "2"], "value": {"value": 1, "unit": "kohm"}},
+            {"reference": "R2", "type": "resistor", "pins": ["1", "2"], "value": {"value": 1, "unit": "kohm"}},
+        ], "exclusions": []}
+        code, report = self.call(f"/api/projects/{project_id}/simulations/dc-operating-point/from-model", {"mapping": mapping}, "POST")
+        self.assertEqual(code, 201)
+        self.assertEqual(report["kind"], "circuit_graph_bound_linear_dc_mna_operating_point")
+        self.assertTrue(report["component_coverage"]["all_components_accounted"])
+        self.assertFalse(report["component_coverage"]["has_exclusions"])
+        self.assertIn("not datasheet-verified", report["calculation"]["warnings"][1])
+        self.assertIn("10k", model["components"][1]["value"])
+        self.assertEqual(report["generated_netlist"]["elements"][0]["voltage"], {"value": 5, "unit": "V"})
+        mid_node = report["mapping_report"]["net_name_to_solver_node"]["MID"]
+        self.assertAlmostEqual(report["calculation"]["outputs"]["node_voltages"][mid_node]["value"], 2.5)
+        code, history = self.call(f"/api/projects/{project_id}/simulations")
+        self.assertEqual(code, 200)
+        self.assertEqual(history["simulations"][-1]["kind"], "circuit_graph_bound_linear_dc_mna_operating_point")
+        self.assertEqual(history["simulations"][-1]["netlist_status"], "intact")
+        self.assertEqual(history["simulations"][-1]["mapping_status"], "intact")
+        incomplete = {"ground_net": "GND", "bindings": mapping["bindings"][:1], "exclusions": []}
+        code, rejected = self.call(f"/api/projects/{project_id}/simulations/dc-operating-point/from-model", {"mapping": incomplete}, "POST")
+        self.assertEqual(code, 422)
+        self.assertIn("unaccounted", rejected["error"])
+        partial = {"ground_net": "GND", "bindings": mapping["bindings"][:1],
+                   "exclusions": [{"reference": "R1", "reason": "No approved model for this experiment"},
+                                  {"reference": "R2", "reason": "No approved model for this experiment"}]}
+        code, partial_report = self.call(f"/api/projects/{project_id}/simulations/dc-operating-point/from-model", {"mapping": partial}, "POST")
+        self.assertEqual(code, 201)
+        self.assertTrue(partial_report["component_coverage"]["has_exclusions"])
+        self.assertTrue(any("partial model" in warning for warning in partial_report["calculation"]["warnings"]))
 
     def test_linear_dc_mna_report_preserves_netlist_hash_and_model_association(self):
         _, created = self.call("/api/projects", {"name": "MNA DC check", "description": "Explicit linear DC model", "inventory": "", "architecture": "discrete"}, "POST")
