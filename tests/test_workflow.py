@@ -2,12 +2,14 @@ import json
 import tempfile
 import unittest
 import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from circuitmind.calculations import led_current_limit_resistor, ne555_astable_frequency, voltage_divider
 from circuitmind.circuit import connect_pins, create_component, create_net, validate_connectivity
-from circuitmind.models import CircuitModel
-from circuitmind.models import ProjectInput
+from circuitmind.circuit_schema import export_kicad_netlist, migrate_model, new_circuit_model, validate_model
+from circuitmind.models import CircuitModel, ProjectInput
+from circuitmind.project_store import list_snapshots, load_circuit, restore_snapshot, save_circuit
 from circuitmind.workflow import analyze, make_zip, parse_inventory
 
 
@@ -64,6 +66,113 @@ class CircuitModelTests(unittest.TestCase):
         self.assertTrue(any("multiple nets" in error for error in report["errors"]))
         with self.assertRaises(ValueError):
             connect_pins(model, "A", "U1", "99")
+
+
+class VersionedCircuitSchemaTests(unittest.TestCase):
+    def test_v1_migration_preserves_connections_without_inventing_symbols(self):
+        legacy = {"schema_version": 1, "status": "connectivity-draft",
+                  "components": [{"reference": "R1", "part": "10k", "pins": {"1": "A", "2": "B"}}],
+                  "nets": [{"name": "SIG", "terminals": [{"reference": "R1", "pin": "1"}]}],
+                  "inventory_components": [{"part": "resistor", "quantity": 1}]}
+        migrated = migrate_model(legacy)
+        self.assertEqual(migrated["schema_version"], 2)
+        self.assertEqual(migrated["components"][0]["pins"][0]["number"], "1")
+        self.assertIsNone(migrated["components"][0]["symbol"])
+        self.assertEqual(migrated["nets"][0]["terminals"][0]["pin"], "1")
+        migrated_report = validate_model(migrated)
+        self.assertTrue(migrated_report["topology_valid"])
+        self.assertTrue(migrated_report["warnings"])
+        with self.assertRaises(ValueError):
+            migrate_model({"schema_version": 999})
+
+    def test_netlist_is_xml_and_requires_symbol_ids(self):
+        model = new_circuit_model()
+        pins = [{"number": "1", "name": "A", "type": "passive"}, {"number": "2", "name": "B", "type": "passive"}]
+        for ref in ("R1", "R2"):
+            model["components"].append({"reference": ref, "value": "10k", "symbol": {"library": "Device", "name": "R"},
+                                         "footprint": "Resistor_SMD:R_0603_1608Metric", "datasheet": "", "pins": pins,
+                                         "position_mm": {"x": 10.0 if ref == "R1" else 20.0, "y": 5.0}, "rotation_deg": 0})
+        model["nets"].append({"name": "SENSE", "terminals": [{"reference": "R1", "pin": "2"}, {"reference": "R2", "pin": "1"}]})
+        self.assertTrue(validate_model(model)["topology_valid"])
+        root = ET.fromstring(export_kicad_netlist(model, "test-project"))
+        self.assertEqual(root.tag, "export")
+        self.assertEqual(root.find("./components/comp[@ref='R1']/libsource").attrib, {"lib": "Device", "part": "R"})
+        self.assertEqual(root.find("./libparts/libpart[@part='R']/fields/field[@name='Reference']").text, "R")
+        self.assertEqual(root.find("./nets/net[@name='SENSE']/node[@ref='R2']").attrib["pin"], "1")
+        model["components"][0]["symbol"] = None
+        with self.assertRaisesRegex(ValueError, "unresolved"):
+            export_kicad_netlist(model)
+
+    def test_duplicate_pin_assignment_and_untrusted_status_are_rejected(self):
+        model = new_circuit_model()
+        component = {"reference": "U1", "value": "IC", "symbol": None,
+                     "pins": [{"number": "1", "name": "IN", "type": "input"}],
+                     "position_mm": {"x": 0, "y": 0}, "rotation_deg": 0}
+        model["components"] = [component]
+        model["nets"] = [{"name": "A", "terminals": [{"reference": "U1", "pin": "1"}, {"reference": "U1", "pin": "1"}]},
+                          {"name": "B", "terminals": [{"reference": "U1", "pin": "1"}, {"reference": "U1", "pin": "1"}]}]
+        report = validate_model(model)
+        self.assertFalse(report["topology_valid"])
+        self.assertTrue(any("multiple nets" in error for error in report["errors"]))
+        model["nets"] = []
+        model["status"] = "hardware-tested"
+        self.assertFalse(validate_model(model)["topology_valid"])
+
+    def test_malformed_nested_values_fail_closed_without_type_errors(self):
+        model = new_circuit_model()
+        model["components"] = [{"reference": "R1", "value": "x", "symbol": None,
+                                "pins": [{"number": [], "name": "x", "type": {}}],
+                                "position_mm": {"x": 0, "y": 0}, "rotation_deg": 0}]
+        model["nets"] = [{"name": "N", "terminals": [{"reference": [], "pin": {}}]}]
+        report = validate_model(model)
+        self.assertFalse(report["topology_valid"])
+        self.assertTrue(report["errors"])
+        model = new_circuit_model()
+        model["components"] = [{"reference": "R1", "value": "bad\x00value", "symbol": None,
+                                "pins": [{"number": "1", "name": "A", "type": "passive"}],
+                                "position_mm": {"x": 0, "y": 0}, "rotation_deg": 0}]
+        self.assertFalse(validate_model(model)["topology_valid"])
+
+
+class SnapshotTests(unittest.TestCase):
+    def test_tampered_snapshot_is_rejected_by_digest(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project_id = "012345abcdef"
+            folder = Path(temp) / "projects" / project_id
+            folder.mkdir(parents=True)
+            original = new_circuit_model()
+            (folder / "circuit_model.json").write_text(json.dumps(original), "utf-8")
+            updated = json.loads(json.dumps(original))
+            updated["limitations"].append("changed")
+            snapshots = save_circuit(project_id, folder, updated)
+            snapshot_id = snapshots["snapshots"][0]["snapshot_id"]
+            damaged = json.loads((folder / "snapshots" / f"{snapshot_id}.json").read_text("utf-8"))
+            damaged["limitations"].append("tampered")
+            (folder / "snapshots" / f"{snapshot_id}.json").write_text(json.dumps(damaged), "utf-8")
+            with self.assertRaisesRegex(ValueError, "integrity"):
+                restore_snapshot(project_id, folder, snapshot_id)
+
+    def test_save_and_restore_are_immutable_revisions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project_id = "abcdef123456"
+            folder = root / "projects" / project_id
+            folder.mkdir(parents=True)
+            original = new_circuit_model()
+            (folder / "circuit_model.json").write_text(json.dumps(original), "utf-8")
+            changed = json.loads(json.dumps(original))
+            changed["limitations"].append("edit one")
+            snapshots = save_circuit(project_id, folder, changed)
+            self.assertEqual(snapshots["count"], 1)
+            self.assertEqual(load_circuit(folder)["limitations"][-1], "edit one")
+            previous_id = snapshots["snapshots"][0]["snapshot_id"]
+            restored, _ = restore_snapshot(project_id, folder, previous_id)
+            self.assertEqual(restored["limitations"], original["limitations"])
+            self.assertEqual(list_snapshots(project_id, folder)["count"], 2)
+            archive_path = root / "sample.zip"
+            archive_path.write_bytes(make_zip(folder))
+            with zipfile.ZipFile(archive_path) as archive:
+                self.assertTrue(any("snapshots/" in name for name in archive.namelist()))
 
 
 class WorkflowTests(unittest.TestCase):

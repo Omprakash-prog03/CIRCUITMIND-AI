@@ -8,13 +8,13 @@ import re
 import unicodedata
 import uuid
 import zipfile
-from collections import defaultdict
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 from .calculations import led_current_limit_resistor, ne555_astable_frequency
-from .models import CircuitModel, InventoryItem, ProjectInput, ProjectRecord, utc_now
+from .circuit_schema import new_circuit_model
+from .models import InventoryItem, ProjectInput, ProjectRecord, utc_now
 
 
 _REQUIRED_DISCRETE = {
@@ -101,10 +101,11 @@ def analyze(project_input: ProjectInput, root: Path) -> tuple[ProjectRecord, dic
     project_id = uuid.uuid4().hex[:12]
     now = utc_now()
     requirements = _requirements(project_input.description, project_input.architecture)
-    model = CircuitModel(status="requirements-only", limitations=[
+    model = new_circuit_model()
+    model["limitations"] = [
         "No datasheet-derived pin assignments or nets are invented.",
-        "This milestone generates a requirements/design-intake model, not an electrical schematic or KiCad file.",
-    ])
+        "This milestone generates a requirements/design-intake model, not an electrical schematic.",
+    ]
     checks = {
         "requirements_analysis": "completed-deterministic-intake",
         "inventory_parsing": "completed",
@@ -124,13 +125,14 @@ def analyze(project_input: ProjectInput, root: Path) -> tuple[ProjectRecord, dic
         "illustrative_ne555_near_1hz": ne555_astable_frequency(47_000, 47_000, 10e-6),
         "scope": "Examples only, not design-approved values. Supply, actual LED Vf/current, IC output capability, tolerances, and timing accuracy must be validated against exact datasheets.",
     }
-    components = [{"reference": f"U{n+1}", "part": item.name, "quantity": item.quantity,
-                   "datasheet_status": "unverified", "pinout_status": "unresolved"} for n, item in enumerate(inventory)]
+    model["inventory"] = [{"part": item.name, "quantity": item.quantity, "source_line": item.raw,
+                           "datasheet_status": "unverified", "pinout_status": "unresolved"} for item in inventory]
     artifacts: dict[str, bytes] = {
         "engineering_spec.json": _json_bytes(requirements),
         "bom.csv": _bom_csv(inventory),
         "architecture.md": _architecture_text(project_input, findings),
-        "circuit_model.json": _json_bytes({**asdict(model), "inventory_components": components}),
+        "circuit_model.json": _json_bytes(model),
+        "kicad_export_report.json": _json_bytes({"status": "blocked", "format": "KiCad legacy XML netlist", "reasons": ["No pin-level component instances or nets are present; inventory entries have not been promoted to verified circuit symbols."], "kicad_cli_validation": "not-run"}),
         "calculations.json": _json_bytes(calculations),
         "validation_report.json": _json_bytes(validation),
         "README.md": _project_readme(project_input, project_id, findings),
@@ -187,7 +189,7 @@ def _project_readme(project_input: ProjectInput, project_id: str, findings: list
 def make_zip(project_dir: Path) -> bytes:
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for path in sorted(project_dir.iterdir()):
+        for path in sorted(project_dir.rglob("*")):
             if path.is_file():
-                archive.write(path, arcname=f"{project_dir.name}/{path.name}")
+                archive.write(path, arcname=f"{project_dir.name}/{path.relative_to(project_dir)}")
     return output.getvalue()

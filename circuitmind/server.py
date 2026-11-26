@@ -1,16 +1,21 @@
 """Local HTTP API and static application server."""
 from __future__ import annotations
 
+import hashlib
 import json
 import mimetypes
 import os
+import threading
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from . import __version__
+from .circuit_schema import export_kicad_netlist, migrate_model, validate_model
 from .integrations import discover_integrations
 from .models import ProjectInput
+from .project_store import list_snapshots, load_circuit, restore_snapshot, save_circuit
 from .workflow import analyze, make_zip
 
 
@@ -18,6 +23,11 @@ ROOT = Path(__file__).resolve().parent.parent
 WEB = ROOT / "web"
 DATA_DIR = Path(os.environ.get("CIRCUITMIND_DATA_DIR", ROOT / "workspace")).expanduser().resolve()
 MAX_BODY = 1_000_000
+_CIRCUIT_API_LOCK = threading.RLock()
+
+
+class RequestTooLarge(Exception):
+    pass
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -52,6 +62,20 @@ class Handler(BaseHTTPRequestHandler):
                         continue
             return self._json(200, {"projects": records})
         parts = parsed.path.strip("/").split("/")
+        if len(parts) == 4 and parts[0:2] == ["api", "projects"] and parts[3] in {"circuit", "snapshots"}:
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            if parts[3] == "snapshots":
+                return self._json(200, list_snapshots(project_id, folder))
+            try:
+                model = load_circuit(folder)
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                return self._json(500, {"error": f"Circuit model could not be loaded: {exc}"})
+            return self._json(200, {"model": model, "topology_report": validate_model(model)})
         if len(parts) == 4 and parts[0:2] == ["api", "projects"] and parts[3] == "export":
             project_id = parts[2]
             if not _valid_id(project_id):
@@ -105,28 +129,161 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self) -> None:
-        if urlparse(self.path).path != "/api/projects":
+        path = urlparse(self.path).path
+        parts = path.strip("/").split("/")
+        if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["circuit", "validate"]:
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            if not (DATA_DIR / "projects" / project_id).is_dir():
+                return self._json(404, {"error": "Project not found"})
+            try:
+                payload = self._read_payload()
+                model = migrate_model(payload.get("model"))
+                report = validate_model(model)
+                if not report["topology_valid"]:
+                    return self._json(422, {"error": "Circuit model failed schema/topology checks", "topology_report": report})
+                try:
+                    export_kicad_netlist(model, source_name=f"CIRCUITMIND-{project_id}")
+                    export_state = "netlist generation available; library resolution and KiCad CLI validation not run"
+                except ValueError as exc:
+                    export_state = f"blocked: {exc}"
+                return self._json(200, {"topology_report": report, "kicad_export": export_state})
+            except RequestTooLarge as exc:
+                return self._json(413, {"error": str(exc)})
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                return self._json(400, {"error": str(exc)})
+        if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["snapshots", "restore"]:
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            try:
+                payload = self._read_payload()
+                snapshot_id = payload.get("snapshot_id")
+                if not isinstance(snapshot_id, str):
+                    raise ValueError("snapshot_id is required")
+                folder = DATA_DIR / "projects" / project_id
+                if not folder.is_dir():
+                    return self._json(404, {"error": "Project not found"})
+                with _CIRCUIT_API_LOCK:
+                    model, snapshots = restore_snapshot(project_id, folder, snapshot_id)
+                    export_report = _refresh_circuit_artifacts(project_id, folder, model)
+                return self._json(200, {"model": model, "topology_report": validate_model(model), "kicad_export": export_report, "snapshots": snapshots})
+            except RequestTooLarge as exc:
+                return self._json(413, {"error": str(exc)})
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                return self._json(400, {"error": str(exc)})
+            except FileNotFoundError as exc:
+                return self._json(404, {"error": str(exc)})
+            except OSError as exc:
+                return self._json(500, {"error": f"Unable to restore snapshot: {exc}"})
+        if path != "/api/projects":
             return self._json(404, {"error": "Not found"})
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            return self._json(400, {"error": "Invalid Content-Length"})
-        if length <= 0 or length > MAX_BODY:
-            return self._json(413, {"error": f"Request must be between 1 and {MAX_BODY} bytes"})
-        try:
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
-            if not isinstance(payload, dict):
-                raise ValueError("JSON request must be an object")
+            payload = self._read_payload()
             values = ProjectInput(name=str(payload.get("name", "")), description=str(payload.get("description", "")),
                                   inventory_text=str(payload.get("inventory", "")), architecture=str(payload.get("architecture", "discrete")))
             record, _ = analyze(values, DATA_DIR)
             return self._json(201, record.to_dict())
+        except RequestTooLarge as exc:
+            return self._json(413, {"error": str(exc)})
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             return self._json(400, {"error": f"Invalid JSON: {exc}"})
         except ValueError as exc:
             return self._json(400, {"error": str(exc)})
         except OSError as exc:
             return self._json(500, {"error": f"Unable to save project: {exc}"})
+
+    def do_PUT(self) -> None:
+        parts = urlparse(self.path).path.strip("/").split("/")
+        if len(parts) != 4 or parts[:2] != ["api", "projects"] or parts[3] != "circuit":
+            return self._json(404, {"error": "Not found"})
+        project_id = parts[2]
+        if not _valid_id(project_id):
+            return self._json(400, {"error": "Invalid project id"})
+        folder = DATA_DIR / "projects" / project_id
+        if not folder.is_dir():
+            return self._json(404, {"error": "Project not found"})
+        try:
+            payload = self._read_payload()
+            incoming = payload.get("model")
+            if not isinstance(incoming, dict):
+                raise ValueError("Request must contain a circuit model object under 'model'")
+            model = migrate_model(incoming)
+            report = validate_model(model)
+            if not report["topology_valid"]:
+                return self._json(422, {"error": "Circuit model failed schema/topology checks", "topology_report": report})
+            with _CIRCUIT_API_LOCK:
+                snapshots = save_circuit(project_id, folder, model)
+                export_report = _refresh_circuit_artifacts(project_id, folder, model)
+            return self._json(200, {"model": model, "topology_report": report, "kicad_export": export_report, "snapshots": snapshots})
+        except RequestTooLarge as exc:
+            return self._json(413, {"error": str(exc)})
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            return self._json(400, {"error": str(exc)})
+        except OSError as exc:
+            return self._json(500, {"error": f"Unable to save circuit model: {exc}"})
+
+    def _read_payload(self) -> dict[str, object]:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ValueError("Invalid Content-Length") from exc
+        if length <= 0:
+            raise ValueError("Request body must not be empty")
+        if length > MAX_BODY:
+            raise RequestTooLarge(f"Request exceeds the {MAX_BODY}-byte limit")
+        payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("JSON request must be an object")
+        return payload
+
+
+def _refresh_circuit_artifacts(project_id: str, folder: Path, model: dict[str, object]) -> dict[str, object]:
+    """Update graph/export reports from the persisted model without claiming ERC."""
+    with _CIRCUIT_API_LOCK:
+        topology = validate_model(model)
+        _atomic_bytes(folder / "connectivity_report.json", (json.dumps(topology, indent=2, ensure_ascii=False) + "\n").encode())
+        try:
+            netlist = export_kicad_netlist(model, source_name=f"CIRCUITMIND-{project_id}")
+            _atomic_bytes(folder / "kicad_netlist.net", netlist)
+            export_report: dict[str, object] = {"status": "generated; symbol-library resolution and KiCad CLI validation not run", "format": "KiCad legacy XML netlist", "file": "kicad_netlist.net", "sha256": hashlib.sha256(netlist).hexdigest()}
+        except ValueError as exc:
+            (folder / "kicad_netlist.net").unlink(missing_ok=True)
+            export_report = {"status": "blocked", "format": "KiCad legacy XML netlist", "reasons": [str(exc)], "kicad_cli_validation": "not-run"}
+        _atomic_bytes(folder / "kicad_export_report.json", (json.dumps(export_report, indent=2, ensure_ascii=False) + "\n").encode())
+        validation_path = folder / "validation_report.json"
+        validation = json.loads(validation_path.read_text("utf-8")) if validation_path.exists() else {"checks": {}, "findings": []}
+        checks = validation.setdefault("checks", {})
+        if topology["component_count"] and topology["net_count"]:
+            checks["electrical_connectivity"] = "topology-only pass; electrical ERC not run"
+        else:
+            checks["electrical_connectivity"] = "not-run (no pin-level connected circuit graph)"
+        checks["kicad_netlist_export"] = export_report["status"]
+        checks["electrical_rule_check"] = "not-run (KiCad CLI/ERC not invoked)"
+        _atomic_bytes(validation_path, (json.dumps(validation, indent=2, ensure_ascii=False) + "\n").encode())
+        project_path = folder / "project.json"
+        if project_path.exists():
+            record = json.loads(project_path.read_text("utf-8"))
+            record["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            record["validation"] = validation
+            artifacts = {path.name for path in folder.iterdir() if path.is_file() and path.name != "project.json"}
+            record["artifacts"] = sorted(artifacts)
+            _atomic_bytes(project_path, (json.dumps(record, indent=2, ensure_ascii=False) + "\n").encode())
+        return export_report
+
+
+def _atomic_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        with temporary.open("wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _valid_id(project_id: str) -> bool:

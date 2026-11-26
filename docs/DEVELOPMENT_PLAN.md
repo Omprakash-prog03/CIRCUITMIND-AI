@@ -10,11 +10,12 @@ The repository began as a README-only shell. Implement in vertical slices; each 
 - Add a typed circuit-model boundary and connectivity validation; report limitations accurately.
 - Acceptance: no-dependency server starts; user can create project end to end; missing components are surfaced; outputs do not claim unrun checks.
 
-## Milestone 2 — Circuit model and schematic interoperability
+## Milestone 2 — Versioned circuit graph and netlist interoperability (implemented slice; schematic work remains)
 
-- Promote editable circuit model to versioned component/pin/net schema, graph validation, snapshots and migration tests.
-- Add KiCad adapter with real symbol-library resolution and export; open generated output in KiCad CLI when installed.
-- Require pinout provenance and electrical rule-check evidence; keep unknown pins unresolved.
+- Versioned schema v2 for model components, declared pins, placements, nets, and endpoints; v1 migration preserves only known fields and never infers symbols.
+- Browser JSON editor, non-mutating schema/topology validation, atomic saves, SHA-256 snapshots, restore, and archive inclusion.
+- KiCad legacy XML netlist generation gated on explicit symbol IDs and consistent graph/pin declarations; no static image is passed off as a schematic.
+- Symbol library resolution against actual installed libraries, pinout provenance, visual schematic editor, and KiCad CLI/ERC execution remain unimplemented. This environment has no `kicad-cli`; generated netlist bytes are not CLI-validated.
 
 ## Milestone 3 — Engineering integrations
 
