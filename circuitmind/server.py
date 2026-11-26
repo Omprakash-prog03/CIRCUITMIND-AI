@@ -17,8 +17,8 @@ from .circuit_schema import export_kicad_netlist, migrate_model, validate_model
 from .integrations import discover_integrations, run_kicad_drc, run_kicad_erc, run_ngspice, run_pdftotext
 from .kicad_symbols import resolve_kicad_symbol
 from .engineering import (clock_divider_candidate, clock_timebase_error, led_series_resistor,
-                          solve_dc_operating_point, map_circuit_graph_to_mna, simulate_transient_rc,
-                          synthesize_rc_lowpass)
+                          solve_dc_operating_point, simulate_dc_sweep, map_circuit_graph_to_mna, map_circuit_graph_to_ac,
+                          simulate_transient_rc, simulate_ac_sweep, synthesize_rc_lowpass)
 from .engineering.cpp_engine import CppEngineUnavailable
 from .spice import validate_spice_deck
 from .models import ProjectInput
@@ -116,10 +116,11 @@ class Handler(BaseHTTPRequestHandler):
                 model = load_circuit(folder)
                 current_hash = hashlib.sha256(json.dumps(model, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
                 runs = []
-                report_paths = sorted([*folder.glob("simulation_mna_*.json"), *folder.glob("simulation_transient_rc_*.json")])
+                report_paths = sorted([*folder.glob("simulation_mna_*.json"), *folder.glob("simulation_transient_rc_*.json"), *folder.glob("simulation_transient_rlc_*.json"),
+                                       *folder.glob("simulation_ac_sweep_*.json"), *folder.glob("simulation_dc_sweep_*.json")])
                 for report_path in report_paths:
                     report = json.loads(report_path.read_text("utf-8"))
-                    if report.get("kind") not in {"linear_dc_mna_operating_point", "circuit_graph_bound_linear_dc_mna_operating_point", "circuit_graph_bound_linear_rc_transient"}:
+                    if report.get("kind") not in {"linear_dc_mna_operating_point", "piecewise_linear_diode_dc_operating_point", "shockley_diode_dc_operating_point", "circuit_graph_bound_linear_dc_mna_operating_point", "circuit_graph_bound_piecewise_linear_diode_dc_operating_point", "circuit_graph_bound_shockley_diode_dc_operating_point", "circuit_graph_bound_linear_rc_transient", "circuit_graph_bound_linear_rlc_transient", "linear_ac_sweep", "circuit_graph_bound_linear_ac_sweep", "linear_dc_source_sweep", "bounded_diode_dc_source_sweep", "circuit_graph_bound_linear_dc_source_sweep", "circuit_graph_bound_bounded_diode_dc_source_sweep"}:
                         continue
                     netlist = report.get("input_netlist", report.get("generated_netlist"))
                     recorded_netlist_hash = report.get("netlist_sha256")
@@ -139,16 +140,41 @@ class Handler(BaseHTTPRequestHandler):
                         mapping_status = "intact" if actual_mapping_hash == recorded_mapping_hash else "hash-mismatch"
                     calculation = report.get("calculation", {})
                     outputs = calculation.get("outputs", {}) if isinstance(calculation, dict) else {}
-                    if isinstance(outputs, dict) and "time_points_s" in outputs:
+                    if isinstance(outputs, dict) and "sweep_values" in outputs:
+                        values = outputs.get("sweep_values", [])
+                        traces = outputs.get("node_voltage_traces_v", {})
+                        outputs = {"status": outputs.get("status"), "swept_element_reference": outputs.get("swept_element_reference"),
+                                   "swept_parameter": outputs.get("swept_parameter"), "sweep_unit": outputs.get("sweep_unit"),
+                                   "sweep_scale": outputs.get("sweep_scale"), "point_count": outputs.get("point_count"),
+                                   "start_value": values[0] if values else None, "stop_value": values[-1] if values else None,
+                                   "final_node_voltages_v": {node: trace[-1] for node, trace in traces.items() if trace},
+                                   "trace_node_count": len(traces),
+                                   "maximum_normalized_equation_residual": outputs.get("maximum_normalized_equation_residual")}
+                    elif isinstance(outputs, dict) and "time_points_s" in outputs:
                         times = outputs.get("time_points_s", [])
                         node_traces = outputs.get("node_voltage_traces_v", {})
                         cap_traces = outputs.get("capacitor_voltage_traces_v", {})
+                        inductor_traces = outputs.get("inductor_current_traces_a", {})
                         outputs = {"method": outputs.get("method"), "status": outputs.get("status"),
                                    "sample_count": outputs.get("sample_count"), "time_step": outputs.get("time_step"),
                                    "stop_time": outputs.get("stop_time"), "final_time_s": times[-1] if times else None,
                                    "final_node_voltages_v": {node: trace[-1] for node, trace in node_traces.items() if trace},
                                    "final_capacitor_voltages_v": {ref: trace[-1] for ref, trace in cap_traces.items() if trace},
-                                   "trace_node_count": len(node_traces), "trace_capacitor_count": len(cap_traces)}
+                                   "final_inductor_currents_a": {ref: trace[-1] for ref, trace in inductor_traces.items() if trace},
+                                   "trace_node_count": len(node_traces), "trace_capacitor_count": len(cap_traces),
+                                   "trace_inductor_count": len(inductor_traces)}
+                    elif isinstance(outputs, dict) and "frequency_points_hz" in outputs:
+                        frequencies = outputs.get("frequency_points_hz", [])
+                        magnitudes = outputs.get("node_voltage_magnitude_traces_v", {})
+                        phases = outputs.get("node_voltage_phase_traces_deg", {})
+                        outputs = {"status": outputs.get("status"), "scale": outputs.get("scale"),
+                                   "frequency_point_count": outputs.get("frequency_point_count"),
+                                   "start_frequency": outputs.get("start_frequency"),
+                                   "stop_frequency": outputs.get("stop_frequency"),
+                                   "final_frequency_hz": frequencies[-1] if frequencies else None,
+                                   "final_node_voltage_magnitudes_v": {node: trace[-1] for node, trace in magnitudes.items() if trace},
+                                   "final_node_voltage_phases_deg": {node: trace[-1] for node, trace in phases.items() if trace},
+                                   "trace_node_count": len(magnitudes)}
                     runs.append({"run_id": report.get("run_id"), "kind": report.get("kind"),
                                  "created_at": report.get("created_at"), "artifact": report_path.name,
                                  "model_status": "same-at-run" if report.get("circuit_model_sha256") == current_hash else "model-changed-since-run",
@@ -326,7 +352,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(422, {"error": str(exc)})
             except OSError as exc:
                 return self._json(500, {"error": f"RC low-pass synthesis report could not be stored: {exc}"})
-        if len(parts) == 6 and parts[:2] == ["api", "projects"] and parts[3:] == ["simulations", "transient-rc", "from-model"]:
+        if len(parts) == 6 and parts[:2] == ["api", "projects"] and parts[3] == "simulations" and parts[4] in {"transient-rc", "transient-rlc"} and parts[5] == "from-model":
+            is_rlc = parts[4] == "transient-rlc"
             project_id = parts[2]
             if not _valid_id(project_id):
                 return self._json(400, {"error": "Invalid project id"})
@@ -342,27 +369,30 @@ class Handler(BaseHTTPRequestHandler):
                     topology = validate_model(model)
                     if not topology["topology_valid"]:
                         return self._json(409, {"error": "Saved circuit model failed schema/topology checks", "topology_report": topology})
-                    resolved = map_circuit_graph_to_mna(model, payload["mapping"], allow_capacitors=True)
+                    resolved = map_circuit_graph_to_mna(model, payload["mapping"], allow_capacitors=True,
+                                                       allow_inductors=is_rlc)
                     simulation_input = {"ground": resolved["netlist"]["ground"], "time_step": payload["time_step"],
                                         "stop_time": payload["stop_time"], "method": "backward_euler",
                                         "elements": resolved["netlist"]["elements"]}
                     calculation = simulate_transient_rc(simulation_input)
                     calculation["scope"] = "Numerical backward-Euler time-domain simulation with connectivity from the saved graph and explicit user component types, ordered pins, values, sources, and initial conditions; not datasheet or design approval."
-                    calculation["warnings"].append("Graph connectivity came from the saved model; element types, values, source waveform, and capacitor initial conditions came from the per-run user mapping.")
+                    calculation["warnings"].append("Graph connectivity came from the saved model; element types, values, source waveform, and reactive-element initial conditions came from the per-run user mapping.")
                     if resolved["excluded_components"]:
-                        calculation["warnings"].append("Excluded components were omitted; this transient solve covers only the explicitly mapped RC subnetwork.")
+                        calculation["warnings"].append("Excluded components were omitted; this transient solve covers only the explicitly mapped subnetwork.")
                     model_hash = hashlib.sha256(json.dumps(model, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
                     mapping = payload["mapping"]
                     mapping_hash = hashlib.sha256(json.dumps(mapping, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
                     netlist_hash = hashlib.sha256(json.dumps(simulation_input, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
                     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
-                    report_name = f"simulation_transient_rc_{run_id}.json"
+                    transient_kind = "circuit_graph_bound_linear_rlc_transient" if is_rlc else "circuit_graph_bound_linear_rc_transient"
+                    report_prefix = "simulation_transient_rlc" if is_rlc else "simulation_transient_rc"
+                    report_name = f"{report_prefix}_{run_id}.json"
                     created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-                    report = {"run_id": run_id, "kind": "circuit_graph_bound_linear_rc_transient", "created_at": created_at,
+                    report = {"run_id": run_id, "kind": transient_kind, "created_at": created_at,
                               "circuit_model_sha256": model_hash, "mapping_sha256": mapping_hash, "netlist_sha256": netlist_hash,
                               "input_mapping": mapping, "mapping_report": resolved,
                               "component_coverage": resolved["component_coverage"],
-                              "input_values_source": "saved graph supplies connectivity; per-run explicit mapping supplies R/C/source models, waveform, pin order, and initial conditions",
+                              "input_values_source": "saved graph supplies connectivity; per-run explicit mapping supplies R/C/L/source models, waveform, pin order, and storage-element initial conditions",
                               "calculation": calculation, "generated_netlist": simulation_input, "artifact": report_name}
                     _atomic_bytes(folder / report_name, (json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode())
                     with (folder / "simulation_runs.jsonl").open("a", encoding="utf-8") as log:
@@ -378,7 +408,7 @@ class Handler(BaseHTTPRequestHandler):
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
                 return self._json(422, {"error": str(exc)})
             except OSError as exc:
-                return self._json(500, {"error": f"RC transient report could not be stored: {exc}"})
+                return self._json(500, {"error": f"Transient report could not be stored: {exc}"})
         if len(parts) == 6 and parts[:2] == ["api", "projects"] and parts[3:] == ["simulations", "dc-operating-point", "from-model"]:
             project_id = parts[2]
             if not _valid_id(project_id):
@@ -401,7 +431,7 @@ class Handler(BaseHTTPRequestHandler):
                     calculation["warnings"][1] = "Netlist topology derives from saved graph nets; component type, ordered pins, and numeric values are explicit user mappings, not datasheet-verified."
                     if resolved["excluded_components"]:
                         calculation["warnings"].append("Excluded components were omitted; this is a partial model of the saved circuit graph.")
-                    calculation["scope"] = "Numerical linear DC operating-point solution built from saved graph connectivity plus explicit user type/value/pin mappings; not nonlinear/transient simulation or datasheet approval."
+                    calculation["scope"] = "Numerical bounded DC operating-point solution built from saved graph connectivity plus explicit user type/value/pin/model mappings; diode models are limited to the selected piecewise-linear or Shockley law, not general SPICE validation or datasheet approval."
                     model_hash = hashlib.sha256(json.dumps(model, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
                     mapping_hash = hashlib.sha256(json.dumps(mapping, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
                     netlist = resolved["netlist"]
@@ -409,7 +439,12 @@ class Handler(BaseHTTPRequestHandler):
                     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
                     report_name = f"simulation_mna_{run_id}.json"
                     created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-                    report = {"run_id": run_id, "kind": "circuit_graph_bound_linear_dc_mna_operating_point", "created_at": created_at,
+                    report_kind = ("circuit_graph_bound_shockley_diode_dc_operating_point"
+                                   if calculation["outputs"]["solver_status"] == "solved-shockley-diode-newton-dc-model" else
+                                   "circuit_graph_bound_piecewise_linear_diode_dc_operating_point"
+                                   if calculation["outputs"]["solver_status"] == "solved-piecewise-linear-diode-dc-model"
+                                   else "circuit_graph_bound_linear_dc_mna_operating_point")
+                    report = {"run_id": run_id, "kind": report_kind, "created_at": created_at,
                               "circuit_model_sha256": model_hash, "mapping_sha256": mapping_hash, "netlist_sha256": netlist_hash,
                               "input_mapping": mapping, "mapping_report": resolved,
                               "component_coverage": resolved["component_coverage"],
@@ -430,6 +465,217 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(422, {"error": str(exc)})
             except OSError as exc:
                 return self._json(500, {"error": f"Graph-bound MNA report could not be stored: {exc}"})
+        if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["simulations", "dc-sweep"]:
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            try:
+                payload = self._read_payload(200_000)
+                if set(payload) != {"netlist", "sweep"} or not isinstance(payload.get("netlist"), dict) or not isinstance(payload.get("sweep"), dict):
+                    raise ValueError("Request must contain exactly netlist and sweep objects")
+                simulation_input = {"netlist": payload["netlist"], "sweep": payload["sweep"]}
+                calculation = simulate_dc_sweep(simulation_input)
+                normalized_input = json.loads(json.dumps(simulation_input, sort_keys=True, separators=(",", ":"),
+                                                         ensure_ascii=False, allow_nan=False))
+                input_hash = hashlib.sha256(json.dumps(normalized_input, sort_keys=True, separators=(",", ":"),
+                                                        ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+                with _project_tool_lock(project_id), _CIRCUIT_API_LOCK:
+                    model = load_circuit(folder)
+                    topology = validate_model(model)
+                    if not topology["topology_valid"]:
+                        return self._json(409, {"error": "Saved circuit model is invalid; DC sweep report is not associated with an invalid revision", "topology_report": topology})
+                    model_hash = hashlib.sha256(json.dumps(model, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+                    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+                    report_name = f"simulation_dc_sweep_{run_id}.json"
+                    created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    sweep_kind = ("bounded_diode_dc_source_sweep"
+                                  if calculation["outputs"]["status"] == "completed-bounded-diode-dc-sweep"
+                                  else "linear_dc_source_sweep")
+                    report = {"run_id": run_id, "kind": sweep_kind, "created_at": created_at,
+                              "circuit_model_sha256": model_hash, "netlist_sha256": input_hash,
+                              "model_association": "user-associated saved-model revision; swept netlist was not generated from or matched to the circuit graph",
+                              "input_values_source": "explicit linear DC netlist and selected independent-source sweep range; no component data inferred",
+                              "calculation": calculation, "input_netlist": normalized_input, "artifact": report_name}
+                    _atomic_bytes(folder / report_name, (json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode())
+                    with (folder / "simulation_runs.jsonl").open("a", encoding="utf-8") as log:
+                        log.write(json.dumps({"run_id": run_id, "kind": report["kind"], "created_at": created_at,
+                                              "circuit_model_sha256": model_hash, "netlist_sha256": input_hash,
+                                              "artifact": report_name}, ensure_ascii=False, allow_nan=False) + "\n")
+                        log.flush()
+                        os.fsync(log.fileno())
+                    _update_project_record(folder)
+                return self._json(201, report)
+            except CppEngineUnavailable as exc:
+                return self._json(503, {"error": str(exc)})
+            except RequestTooLarge as exc:
+                return self._json(413, {"error": str(exc)})
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+                return self._json(422, {"error": str(exc)})
+            except OSError as exc:
+                return self._json(500, {"error": f"DC sweep report could not be stored: {exc}"})
+        if len(parts) == 6 and parts[:2] == ["api", "projects"] and parts[3:] == ["simulations", "dc-sweep", "from-model"]:
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            try:
+                payload = self._read_payload(200_000)
+                if set(payload) != {"mapping", "sweep"} or not isinstance(payload.get("mapping"), dict) or not isinstance(payload.get("sweep"), dict):
+                    raise ValueError("Request must contain exactly mapping and sweep objects")
+                with _project_tool_lock(project_id), _CIRCUIT_API_LOCK:
+                    model = load_circuit(folder)
+                    topology = validate_model(model)
+                    if not topology["topology_valid"]:
+                        return self._json(409, {"error": "Saved circuit model failed schema/topology checks", "topology_report": topology})
+                    resolved = map_circuit_graph_to_mna(model, payload["mapping"])
+                    simulation_input = {"netlist": resolved["netlist"], "sweep": payload["sweep"]}
+                    calculation = simulate_dc_sweep(simulation_input)
+                    calculation["scope"] = "Pointwise bounded DC source sweep using saved graph connectivity and explicitly mapped ideal R/V/I/diode models; not general nonlinear/SPICE validation, datasheet qualification, or design approval."
+                    calculation["warnings"].append("Graph connectivity came from the saved model; element type, values, terminal order, and sweep range came from the explicit mapping.")
+                    if resolved["excluded_components"]:
+                        calculation["warnings"].append("Excluded components were omitted; this sweep covers only the explicitly mapped subnetwork.")
+                    model_hash = hashlib.sha256(json.dumps(model, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+                    mapping = payload["mapping"]
+                    mapping_hash = hashlib.sha256(json.dumps(mapping, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+                    netlist_hash = hashlib.sha256(json.dumps(simulation_input, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+                    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+                    report_name = f"simulation_dc_sweep_{run_id}.json"
+                    created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    sweep_kind = ("circuit_graph_bound_bounded_diode_dc_source_sweep"
+                                  if calculation["outputs"]["status"] == "completed-bounded-diode-dc-sweep"
+                                  else "circuit_graph_bound_linear_dc_source_sweep")
+                    report = {"run_id": run_id, "kind": sweep_kind, "created_at": created_at,
+                              "circuit_model_sha256": model_hash, "mapping_sha256": mapping_hash, "netlist_sha256": netlist_hash,
+                              "input_mapping": mapping, "mapping_report": resolved, "component_coverage": resolved["component_coverage"],
+                              "input_values_source": "saved graph supplies connectivity; explicit mapping supplies R/V/I types, values, source direction, and sweep range",
+                              "calculation": calculation, "generated_netlist": simulation_input, "artifact": report_name}
+                    _atomic_bytes(folder / report_name, (json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode())
+                    with (folder / "simulation_runs.jsonl").open("a", encoding="utf-8") as log:
+                        log.write(json.dumps({"run_id": run_id, "kind": report["kind"], "created_at": created_at,
+                                              "circuit_model_sha256": model_hash, "mapping_sha256": mapping_hash,
+                                              "netlist_sha256": netlist_hash, "artifact": report_name}, ensure_ascii=False, allow_nan=False) + "\n")
+                        log.flush()
+                        os.fsync(log.fileno())
+                    _update_project_record(folder)
+                return self._json(201, report)
+            except CppEngineUnavailable as exc:
+                return self._json(503, {"error": str(exc)})
+            except RequestTooLarge as exc:
+                return self._json(413, {"error": str(exc)})
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+                return self._json(422, {"error": str(exc)})
+            except OSError as exc:
+                return self._json(500, {"error": f"Graph-bound DC sweep report could not be stored: {exc}"})
+        if len(parts) == 6 and parts[:2] == ["api", "projects"] and parts[3:] == ["simulations", "ac-sweep", "from-model"]:
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            try:
+                payload = self._read_payload(200_000)
+                if set(payload) != {"mapping", "frequency_sweep"} or not isinstance(payload.get("mapping"), dict):
+                    raise ValueError("Request must contain exactly mapping and frequency_sweep")
+                with _project_tool_lock(project_id), _CIRCUIT_API_LOCK:
+                    model = load_circuit(folder)
+                    topology = validate_model(model)
+                    if not topology["topology_valid"]:
+                        return self._json(409, {"error": "Saved circuit model failed schema/topology checks", "topology_report": topology})
+                    resolved = map_circuit_graph_to_ac(model, payload["mapping"])
+                    simulation_input = {"ground": resolved["netlist"]["ground"],
+                                        "frequency_sweep": payload["frequency_sweep"],
+                                        "elements": resolved["netlist"]["elements"]}
+                    calculation = simulate_ac_sweep(simulation_input)
+                    calculation["scope"] = "Linear AC frequency response using saved graph connectivity and explicit per-run R/C/source models and phases; not datasheet or design approval."
+                    calculation["warnings"].append("Graph connectivity came from the saved model; element values, AC magnitudes, source phases, and ordered pins came from the explicit run mapping.")
+                    if resolved["excluded_components"]:
+                        calculation["warnings"].append("Excluded components were omitted; this sweep covers only the explicitly mapped subnetwork.")
+                    model_hash = hashlib.sha256(json.dumps(model, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+                    mapping = payload["mapping"]
+                    mapping_hash = hashlib.sha256(json.dumps(mapping, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+                    netlist_hash = hashlib.sha256(json.dumps(simulation_input, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+                    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+                    report_name = f"simulation_ac_sweep_{run_id}.json"
+                    created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    report = {"run_id": run_id, "kind": "circuit_graph_bound_linear_ac_sweep", "created_at": created_at,
+                              "circuit_model_sha256": model_hash, "mapping_sha256": mapping_hash, "netlist_sha256": netlist_hash,
+                              "input_mapping": mapping, "mapping_report": resolved,
+                              "component_coverage": resolved["component_coverage"],
+                              "input_values_source": "saved graph supplies connectivity; explicit mapping supplies component types, values, source magnitudes/phases, terminal order, and exclusions",
+                              "calculation": calculation, "generated_netlist": simulation_input, "artifact": report_name}
+                    _atomic_bytes(folder / report_name, (json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode())
+                    with (folder / "simulation_runs.jsonl").open("a", encoding="utf-8") as log:
+                        log.write(json.dumps({"run_id": run_id, "kind": report["kind"], "created_at": created_at,
+                                              "circuit_model_sha256": model_hash, "mapping_sha256": mapping_hash,
+                                              "netlist_sha256": netlist_hash, "artifact": report_name}, ensure_ascii=False, allow_nan=False) + "\n")
+                        log.flush()
+                        os.fsync(log.fileno())
+                    _update_project_record(folder)
+                return self._json(201, report)
+            except CppEngineUnavailable as exc:
+                return self._json(503, {"error": str(exc)})
+            except RequestTooLarge as exc:
+                return self._json(413, {"error": str(exc)})
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+                return self._json(422, {"error": str(exc)})
+            except OSError as exc:
+                return self._json(500, {"error": f"Graph-bound AC sweep report could not be stored: {exc}"})
+        if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["simulations", "ac-sweep"]:
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            try:
+                payload = self._read_payload(200_000)
+                if set(payload) != {"netlist"} or not isinstance(payload.get("netlist"), dict):
+                    raise ValueError("Request must contain exactly one 'netlist' object")
+                netlist = payload["netlist"]
+                calculation = simulate_ac_sweep(netlist)
+                normalized_netlist = json.loads(json.dumps(netlist, sort_keys=True, separators=(",", ":"),
+                                                            ensure_ascii=False, allow_nan=False))
+                netlist_hash = hashlib.sha256(json.dumps(normalized_netlist, sort_keys=True, separators=(",", ":"),
+                                                         ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+                with _project_tool_lock(project_id), _CIRCUIT_API_LOCK:
+                    model = load_circuit(folder)
+                    topology = validate_model(model)
+                    if not topology["topology_valid"]:
+                        return self._json(409, {"error": "Saved circuit model is invalid; AC report is not attached to an invalid revision", "topology_report": topology})
+                    model_hash = hashlib.sha256(json.dumps(model, sort_keys=True, separators=(",", ":"),
+                                                           ensure_ascii=False).encode("utf-8")).hexdigest()
+                    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+                    report_name = f"simulation_ac_sweep_{run_id}.json"
+                    created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    report = {"run_id": run_id, "kind": "linear_ac_sweep", "created_at": created_at,
+                              "circuit_model_sha256": model_hash, "netlist_sha256": netlist_hash,
+                              "model_association": "user-associated saved-model revision; AC netlist was not generated from or matched to the circuit graph",
+                              "input_values_source": "explicit AC netlist values, RMS source magnitudes, phases, and frequency sweep; no component data inferred",
+                              "calculation": calculation, "input_netlist": normalized_netlist, "artifact": report_name}
+                    _atomic_bytes(folder / report_name, (json.dumps(report, indent=2, ensure_ascii=False,
+                                                                     allow_nan=False) + "\n").encode())
+                    with (folder / "simulation_runs.jsonl").open("a", encoding="utf-8") as log:
+                        log.write(json.dumps({"run_id": run_id, "kind": report["kind"], "created_at": created_at,
+                                              "circuit_model_sha256": model_hash, "netlist_sha256": netlist_hash,
+                                              "artifact": report_name}, ensure_ascii=False, allow_nan=False) + "\n")
+                        log.flush()
+                        os.fsync(log.fileno())
+                    _update_project_record(folder)
+                return self._json(201, report)
+            except CppEngineUnavailable as exc:
+                return self._json(503, {"error": str(exc)})
+            except RequestTooLarge as exc:
+                return self._json(413, {"error": str(exc)})
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+                return self._json(422, {"error": str(exc)})
+            except OSError as exc:
+                return self._json(500, {"error": f"AC sweep report could not be stored: {exc}"})
         if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["simulations", "dc-operating-point"]:
             project_id = parts[2]
             if not _valid_id(project_id):
@@ -454,10 +700,15 @@ class Handler(BaseHTTPRequestHandler):
                     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
                     report_name = f"simulation_mna_{run_id}.json"
                     created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-                    report = {"run_id": run_id, "kind": "linear_dc_mna_operating_point", "created_at": created_at,
+                    report_kind = ("shockley_diode_dc_operating_point"
+                                   if calculation["outputs"]["solver_status"] == "solved-shockley-diode-newton-dc-model" else
+                                   "piecewise_linear_diode_dc_operating_point"
+                                   if calculation["outputs"]["solver_status"] == "solved-piecewise-linear-diode-dc-model"
+                                   else "linear_dc_mna_operating_point")
+                    report = {"run_id": run_id, "kind": report_kind, "created_at": created_at,
                               "circuit_model_sha256": model_hash, "netlist_sha256": netlist_hash,
                               "model_association": "user-associated saved-model revision; netlist was not generated from or matched to the circuit graph",
-                              "input_values_source": "explicit user-supplied linear DC netlist; no component data inferred",
+                              "input_values_source": "explicit user-supplied bounded DC netlist and diode parameters; no component data inferred",
                               "calculation": calculation, "input_netlist": normalized_netlist, "artifact": report_name}
                     _atomic_bytes(folder / report_name, (json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode())
                     with (folder / "simulation_runs.jsonl").open("a", encoding="utf-8") as log:

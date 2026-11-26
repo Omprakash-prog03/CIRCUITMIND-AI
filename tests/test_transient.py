@@ -53,6 +53,32 @@ class TransientRcTests(unittest.TestCase):
         self.assertAlmostEqual(result[1], 1 / 1.1)
         self.assertAlmostEqual(result[2], 1 / (1.1**2))
 
+    def test_backward_euler_rl_step_matches_series_current_recurrence(self):
+        netlist = {
+            "ground": "0", "time_step": {"value": 0.1, "unit": "s"},
+            "stop_time": {"value": 0.5, "unit": "s"}, "method": "backward_euler",
+            "elements": [
+                {"type": "voltage_source", "reference": "V1", "nodes": ["VIN", "0"],
+                 "waveform": {"type": "step", "initial": {"value": 0, "unit": "V"},
+                              "final": {"value": 1, "unit": "V"}, "step_time": {"value": 0.1, "unit": "s"}}},
+                {"type": "resistor", "reference": "R1", "nodes": ["VIN", "LTOP"],
+                 "resistance": {"value": 1, "unit": "ohm"}},
+                {"type": "inductor", "reference": "L1", "nodes": ["LTOP", "0"],
+                 "inductance": {"value": 1, "unit": "H"},
+                 "initial_current": {"value": 0, "unit": "A"}},
+            ],
+        }
+        output = simulate_transient_rc(netlist)["outputs"]
+        self.assertEqual(output["status"], "completed-numerical-linear-rlc-transient")
+        self.assertEqual(output["inductor_count"], 1)
+        expected = [0.0]
+        for _ in range(5):
+            expected.append((expected[-1] + 0.1) / 1.1)
+        for actual, reference in zip(output["inductor_current_traces_a"]["L1"], expected):
+            self.assertAlmostEqual(actual, reference, places=12)
+        self.assertAlmostEqual(output["node_voltage_traces_v"]["LTOP"][-1], 1 - expected[-1])
+        self.assertLess(output["maximum_equation_residual"], 1e-10)
+
     def test_current_source_step_is_integrated_with_signed_direction(self):
         netlist = {"ground": "0", "time_step": {"value": .001, "unit": "s"}, "stop_time": {"value": .002, "unit": "s"},
                    "elements": [

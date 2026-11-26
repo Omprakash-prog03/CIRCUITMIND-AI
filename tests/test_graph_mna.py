@@ -50,6 +50,53 @@ class GraphToMnaMappingTests(unittest.TestCase):
         self.assertAlmostEqual(output["node_voltages"][node_map["MID"]]["value"], 2.5)
         self.assertAlmostEqual(output["total_power_balance"]["value"], 0, places=12)
 
+    def test_piecewise_linear_diode_requires_explicit_forward_drop_and_off_resistance(self):
+        model = clock_model()
+        model["components"][2]["reference"] = "D1"
+        for net in model["nets"]:
+            for terminal in net["terminals"]:
+                if terminal["reference"] == "R2":
+                    terminal["reference"] = "D1"
+        request = {"ground_net": "GND", "bindings": [
+            {"reference": "V1", "type": "voltage_source", "pins": ["1", "2"],
+             "value": {"value": 5, "unit": "V"}},
+            {"reference": "R1", "type": "resistor", "pins": ["1", "2"],
+             "value": {"value": 1, "unit": "kohm"}},
+            {"reference": "D1", "type": "diode", "pins": ["1", "2"],
+             "value": {"value": 0.7, "unit": "V"},
+             "off_resistance": {"value": 1e12, "unit": "ohm"}},
+        ], "exclusions": []}
+        resolved = map_circuit_graph_to_mna(model, request)
+        result = solve_dc_operating_point(resolved["netlist"])
+        mid_node = resolved["net_name_to_solver_node"]["MID"]
+        self.assertAlmostEqual(result["outputs"]["node_voltages"][mid_node]["value"], 0.7, places=9)
+        diode = next(item for item in result["outputs"]["elements"] if item["reference"] == "D1")
+        self.assertAlmostEqual(diode["current"]["value"], 4.3e-3, places=9)
+
+    def test_shockley_diode_mapping_preserves_explicit_parameters(self):
+        model = clock_model()
+        model["components"][2]["reference"] = "D1"
+        for net in model["nets"]:
+            for terminal in net["terminals"]:
+                if terminal["reference"] == "R2":
+                    terminal["reference"] = "D1"
+        request = {"ground_net": "GND", "bindings": [
+            {"reference": "V1", "type": "voltage_source", "pins": ["1", "2"],
+             "value": {"value": 5, "unit": "V"}},
+            {"reference": "R1", "type": "resistor", "pins": ["1", "2"],
+             "value": {"value": 1, "unit": "kohm"}},
+            {"reference": "D1", "type": "shockley_diode", "pins": ["1", "2"],
+             "value": {"value": 1e-12, "unit": "A"}, "ideality_factor": 1.0,
+             "temperature_kelvin": {"value": 300, "unit": "K"}},
+        ], "exclusions": []}
+        resolved = map_circuit_graph_to_mna(model, request)
+        element = next(item for item in resolved["netlist"]["elements"] if item["reference"] == "D1")
+        self.assertEqual(element["type"], "shockley_diode")
+        self.assertEqual(element["ideality_factor"], 1.0)
+        self.assertEqual(element["temperature_kelvin"], {"value": 300, "unit": "K"})
+        result = solve_dc_operating_point(resolved["netlist"])
+        self.assertEqual(result["outputs"]["solver_status"], "solved-shockley-diode-newton-dc-model")
+
     def test_never_parses_component_descriptions_and_pin_order_is_explicit(self):
         reversed_mapping = mappings()
         reversed_mapping["bindings"][0]["pins"] = ["2", "1"]

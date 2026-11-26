@@ -8,8 +8,11 @@ from .electrical import (
     rc_time_constant,
 )
 from .dividers import clock_divider_candidate
+from .ac import simulate_ac_sweep
 from .mna import solve_dc_operating_point
+from .dc_sweep import simulate_dc_sweep
 from .graph_mna import map_circuit_graph_to_mna
+from .graph_ac import map_circuit_graph_to_ac
 from .transient import simulate_transient_rc
 from .synthesis import synthesize_rc_lowpass
 from .resistors import led_series_resistor
@@ -18,5 +21,5 @@ from .timebase import clock_timebase_error
 __all__ = [
     "capacitor_energy", "capacitor_network", "inductor_energy", "led_series_resistor",
     "clock_divider_candidate", "clock_timebase_error", "ohms_law", "rc_time_constant", "resistor_network",
-    "solve_dc_operating_point", "map_circuit_graph_to_mna", "simulate_transient_rc", "synthesize_rc_lowpass",
+    "solve_dc_operating_point", "simulate_dc_sweep", "map_circuit_graph_to_mna", "map_circuit_graph_to_ac", "simulate_transient_rc", "simulate_ac_sweep", "synthesize_rc_lowpass",
 ]

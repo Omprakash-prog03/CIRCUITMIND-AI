@@ -19,12 +19,12 @@ extern "C" {
 
 /* Stable C boundary v1. All electrical values passed here are normalized SI. */
 typedef struct cm_element_v1 {
-    uint32_t kind;       /* 0 resistor, 1 capacitor, 2 voltage source, 3 current source */
+    uint32_t kind;       /* 0 resistor, 1 capacitor, 2 voltage source, 3 current source, 4 inductor, 5 PWL DC diode, 6 Shockley DC diode */
     uint32_t node_a;
     uint32_t node_b;
     double value;        /* ohm, farad, volt, or ampere according to kind */
-    double initial_value;/* capacitor initial volts or source-step initial value */
-    double final_value;  /* source-step final value */
+    double initial_value;/* capacitor initial volts, diode off ohms, Shockley ideality, inductor initial amps, or source-step initial value */
+    double final_value;  /* source-step final value or Shockley diode temperature K */
     double step_time_s;
     uint32_t has_step;   /* zero = DC value in value; one = ideal single step */
 } cm_element_v1;
@@ -56,6 +56,26 @@ typedef struct cm_dc_result_v2 {
     size_t unknown_count;
 } cm_dc_result_v2;
 
+typedef struct cm_dc_sweep_request_v1 {
+    uint32_t request_version; /* must be 1 */
+    cm_dc_request_v1 dc_request;
+    uint32_t swept_element_index;
+    size_t point_count;
+    const double* source_values; /* strictly increasing SI voltage/current values */
+} cm_dc_sweep_request_v1;
+
+typedef struct cm_dc_sweep_result_v1 {
+    double* node_voltage_traces_v;
+    size_t node_voltage_capacity;
+    double* maximum_equation_residuals;
+    size_t maximum_residual_capacity;
+    double* normalized_equation_residuals;
+    size_t normalized_residual_capacity;
+    size_t point_count;
+    size_t node_count;
+    size_t unknown_count;
+} cm_dc_sweep_result_v1;
+
 typedef struct cm_transient_request_v1 {
     uint32_t request_version; /* must be 1 */
     uint32_t node_count;      /* includes ground */
@@ -67,6 +87,36 @@ typedef struct cm_transient_request_v1 {
     uint32_t maximum_steps;
 } cm_transient_request_v1;
 
+typedef struct cm_ac_element_v1 {
+    uint32_t kind;       /* 0 resistor, 1 capacitor, 2 voltage source, 3 current source, 4 inductor */
+    uint32_t node_a;
+    uint32_t node_b;
+    double value;        /* ohm, farad, henry, or AC RMS magnitude in V/A */
+    double phase_rad;    /* source phase; must be zero for passive elements */
+} cm_ac_element_v1;
+
+typedef struct cm_ac_sweep_request_v1 {
+    uint32_t request_version; /* must be 1 */
+    uint32_t node_count;      /* includes ground */
+    uint32_t ground_index;
+    uint32_t element_count;
+    const cm_ac_element_v1* elements;
+    size_t frequency_count;
+    const double* frequencies_hz; /* strictly increasing positive frequencies */
+} cm_ac_sweep_request_v1;
+
+typedef struct cm_ac_sweep_result_v1 {
+    double* node_voltage_real_v;
+    size_t node_voltage_real_capacity;
+    double* node_voltage_imag_v;
+    size_t node_voltage_imag_capacity;
+    double* normalized_equation_residuals;
+    size_t residual_capacity;
+    size_t point_count;
+    size_t node_count;
+    size_t unknown_count;
+} cm_ac_sweep_result_v1;
+
 CM_API const char* cm_engine_version(void);
 CM_API uint32_t cm_engine_abi_version(void);
 CM_API int cm_engine_solve_dc_v1(const cm_dc_request_v1* request,
@@ -76,12 +126,18 @@ CM_API int cm_engine_solve_dc_v1(const cm_dc_request_v1* request,
 CM_API int cm_engine_solve_dc_v2(const cm_dc_request_v1* request,
                                   cm_dc_result_v2* result,
                                   char* error_message, size_t error_capacity);
+CM_API int cm_engine_simulate_dc_sweep_v1(const cm_dc_sweep_request_v1* request,
+                                          cm_dc_sweep_result_v1* result,
+                                          char* error_message, size_t error_capacity);
 CM_API int cm_engine_simulate_transient_rc_v1(const cm_transient_request_v1* request,
                                                double* time_points_s, size_t time_capacity,
                                                double* node_voltages_v, size_t voltage_capacity,
                                                size_t* written_samples,
                                                double* maximum_equation_residual,
                                                char* error_message, size_t error_capacity);
+CM_API int cm_engine_simulate_ac_sweep_v1(const cm_ac_sweep_request_v1* request,
+                                          cm_ac_sweep_result_v1* result,
+                                          char* error_message, size_t error_capacity);
 
 #ifdef __cplusplus
 }
