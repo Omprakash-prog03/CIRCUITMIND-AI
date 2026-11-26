@@ -5,6 +5,7 @@ from circuitmind.engineering import (
     capacitor_energy,
     capacitor_network,
     inductor_energy,
+    clock_divider_candidate,
     clock_timebase_error,
     led_series_resistor,
     ohms_law,
@@ -90,6 +91,41 @@ class ClockTimebaseTests(unittest.TestCase):
             lambda: clock_timebase_error({"value": 1, "unit": "Hz"}, {"value": 1, "unit": "Hz"}, 1_000_000),
             lambda: clock_timebase_error({"value": 1, "unit": "Hz"}, {"value": 1, "unit": "Hz"}, True),
             lambda: clock_timebase_error({"value": 1e308, "unit": "Hz"}, {"value": 1e-308, "unit": "Hz"}, 0),
+        ]
+        for calculate in invalid:
+            with self.subTest(calculate=calculate), self.assertRaises(ValueError):
+                calculate()
+
+
+class ClockDividerTests(unittest.TestCase):
+    def test_nearest_integer_modulus_rate_and_tolerance_drift(self):
+        result = clock_divider_candidate({"value": 32_768, "unit": "Hz"}, {"value": 1, "unit": "Hz"}, 20)
+        output = result["outputs"]
+        self.assertEqual(output["candidate_divider_modulus"], 32_768)
+        self.assertAlmostEqual(output["ideal_division_ratio"], 32_768)
+        self.assertAlmostEqual(output["nominal_output_frequency"]["value"], 1)
+        self.assertAlmostEqual(output["nominal_rate_error"]["value"], 0)
+        self.assertAlmostEqual(output["minimum_clock_drift_per_day"]["value"], -1.728)
+        self.assertEqual(output["candidate_status"], "nearest-integer-modulus; implementation not assessed")
+        self.assertTrue(any("counter width" in item for item in result["validity"]))
+
+    def test_quantization_uses_nearest_integer_and_flags_upconversion_request(self):
+        result = clock_divider_candidate({"value": 10, "unit": "Hz"}, {"value": 3, "unit": "Hz"}, 0)
+        self.assertEqual(result["outputs"]["candidate_divider_modulus"], 3)
+        self.assertLess(abs(result["outputs"]["nominal_rate_error"]["value"]), 200_000)
+        half_step = clock_divider_candidate({"value": 5, "unit": "Hz"}, {"value": 2, "unit": "Hz"}, 0)
+        self.assertEqual(half_step["outputs"]["candidate_divider_modulus"], 3)
+        too_fast = clock_divider_candidate({"value": 1, "unit": "Hz"}, {"value": 2, "unit": "Hz"}, 0)
+        self.assertEqual(too_fast["outputs"]["candidate_divider_modulus"], 1)
+        self.assertIn("cannot increase frequency", too_fast["warnings"][0])
+
+    def test_invalid_units_tolerance_and_unrepresentable_modulus_fail_closed(self):
+        invalid = [
+            lambda: clock_divider_candidate({"value": 0, "unit": "Hz"}, {"value": 1, "unit": "Hz"}, 0),
+            lambda: clock_divider_candidate({"value": 1, "unit": "V"}, {"value": 1, "unit": "Hz"}, 0),
+            lambda: clock_divider_candidate({"value": 1, "unit": "Hz"}, {"value": 1, "unit": "Hz"}, float("nan")),
+            lambda: clock_divider_candidate({"value": 1e308, "unit": "Hz"}, {"value": 1e-308, "unit": "Hz"}, 0),
+            lambda: clock_divider_candidate({"value": 2**54, "unit": "Hz"}, {"value": 1, "unit": "Hz"}, 0),
         ]
         for calculate in invalid:
             with self.subTest(calculate=calculate), self.assertRaises(ValueError):

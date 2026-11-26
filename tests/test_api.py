@@ -191,6 +191,23 @@ class CircuitApiTests(unittest.TestCase):
         self.assertIn("none was inferred", audit["components"][0]["reason"])
         self.assertEqual(audit["unresolved_count"], 1)
 
+    def test_clock_divider_candidate_is_saved_as_math_not_implementation_approval(self):
+        _, created = self.call("/api/projects", {"name": "Divider candidate", "description": "Clock rate planning", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        model = self.sample_design()
+        self.assertEqual(self.call(f"/api/projects/{project_id}/circuit", {"model": model}, "PUT")[0], 200)
+        inputs = {"source_frequency": {"value": 32_768, "unit": "Hz"},
+                  "target_frequency": {"value": 1, "unit": "Hz"}, "source_tolerance_ppm": 20}
+        code, report = self.call(f"/api/projects/{project_id}/calculations/clock-divider", {"inputs": inputs}, "POST")
+        self.assertEqual(code, 201)
+        self.assertEqual(report["calculation"]["outputs"]["candidate_divider_modulus"], 32_768)
+        self.assertIn("no component specifications inferred", report["input_values_source"])
+        self.assertIn("counter width", " ".join(report["calculation"]["validity"]))
+        code, history = self.call(f"/api/projects/{project_id}/calculations")
+        self.assertEqual(code, 200)
+        self.assertEqual(history["calculations"][-1]["kind"], "clock_divider_candidate")
+        self.assertEqual(history["calculations"][-1]["status"], "current")
+
     def test_clock_timebase_report_uses_explicit_rates_and_stales_with_model(self):
         _, created = self.call("/api/projects", {"name": "Clock timebase budget", "description": "Analyze explicit one hertz post-divider rate", "inventory": "", "architecture": "discrete"}, "POST")
         project_id = created["project_id"]

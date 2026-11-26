@@ -11,6 +11,18 @@ from .results import result
 _SECONDS_PER_DAY = 86_400.0
 
 
+def _read_tolerance(tolerance_ppm: float) -> float:
+    if isinstance(tolerance_ppm, bool) or not isinstance(tolerance_ppm, (int, float)):
+        raise ValueError("Frequency tolerance must be a finite nonnegative number of ppm")
+    try:
+        tolerance = float(tolerance_ppm)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("Frequency tolerance is outside the finite numeric range") from exc
+    if not math.isfinite(tolerance) or not 0 <= tolerance < 1_000_000:
+        raise ValueError("Frequency tolerance must be finite and in [0, 1,000,000) ppm")
+    return tolerance
+
+
 def clock_timebase_error(nominal_tick_rate: dict[str, Any], target_tick_rate: dict[str, Any],
                          tolerance_ppm: float) -> dict[str, Any]:
     """Bound steady clock-rate error from explicit post-divider rate inputs.
@@ -22,14 +34,7 @@ def clock_timebase_error(nominal_tick_rate: dict[str, Any], target_tick_rate: di
     target = read_quantity(target_tick_rate, "frequency", "target clock tick rate")
     require_positive(nominal)
     require_positive(target)
-    if isinstance(tolerance_ppm, bool) or not isinstance(tolerance_ppm, (int, float)):
-        raise ValueError("Frequency tolerance must be a finite nonnegative number of ppm")
-    try:
-        tolerance = float(tolerance_ppm)
-    except (OverflowError, ValueError) as exc:
-        raise ValueError("Frequency tolerance is outside the finite numeric range") from exc
-    if not math.isfinite(tolerance) or not 0 <= tolerance < 1_000_000:
-        raise ValueError("Frequency tolerance must be finite and in [0, 1,000,000) ppm")
+    tolerance = _read_tolerance(tolerance_ppm)
 
     nominal_hz, target_hz = nominal["si_value"], target["si_value"]
     fractional_tolerance = tolerance / 1_000_000.0

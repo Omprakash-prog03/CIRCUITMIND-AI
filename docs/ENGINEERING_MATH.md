@@ -2,7 +2,7 @@
 
 ## Current implemented scope
 
-`circuitmind.engineering` is a pure-Python calculation library. It does not invoke ngspice or infer values from a component label. Project-linked workflows include a bounded DC LED-series-resistor analysis and a clock timebase rate-error budget, accompanied by foundational Ohm's law, resistor/capacitor series-parallel networks, RC time constant, and ideal capacitor/inductor energy calculations.
+`circuitmind.engineering` is a pure-Python calculation library. It does not invoke ngspice or infer values from a component label. Project-linked workflows include a bounded DC LED-series-resistor analysis, a nearest-integer clock-divider candidate, and a clock timebase rate-error budget, accompanied by foundational Ohm's law, resistor/capacitor series-parallel networks, RC time constant, and ideal capacitor/inductor energy calculations.
 
 Every quantity is entered as `{ "value": number, "unit": "..." }`. Supported input unit conversions are explicit and dimension-checked. Values are normalized to SI before calculation; result inputs retain original and SI values. NaN, infinity, booleans, unsupported unit spellings, wrong dimensions and nonpositive values where prohibited fail closed.
 
@@ -36,6 +36,12 @@ Input ranges must include their nominal values. If a current limit or power rati
 `POST /api/projects/<id>/calculations/led-resistor` runs this real calculation with explicit inputs. Optional `source_refs` values must identify components in the saved circuit model, but they are labels only: numerical values are not read from part descriptions or inferred from those references. The report stores both a canonical circuit-model SHA-256 and an input SHA-256.
 
 `GET /api/projects/<id>/calculations` compares each report's circuit hash with the current saved model and returns `current` or `stale`. A changed circuit does not relabel an old numerical result as current, and the tool does not silently rerun or modify the design. The user can rerun the calculation against the new revision. `current` means revision-hash match only, not engineering approval.
+
+## Integer clock-divider candidate
+
+`clock_divider_candidate` and `POST /api/projects/<id>/calculations/clock-divider` accept explicit source frequency, target tick rate, and source tolerance. They calculate `N = max(1, nearest_integer(f_source / f_target))`, then report the nominal output rate, quantization error, and source-tolerance drift bounds. The rounding is nearest integer with half-up behavior. This is useful for exploring a divider ratio from supplied values; it does not derive component choices or check a physical counter/MCU implementation. The modulus is restricted to the JavaScript-safe integer range to keep saved reports interoperable.
+
+If the requested output exceeds the source frequency, integer division cannot up-convert it; modulus one is returned as the nearest candidate with a warning. A candidate is never called a pass or a hardware design.
 
 ## Clock timebase error budget
 
