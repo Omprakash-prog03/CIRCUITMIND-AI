@@ -13,7 +13,7 @@ from urllib.parse import unquote, urlparse
 
 from . import __version__
 from .circuit_schema import export_kicad_netlist, migrate_model, validate_model
-from .integrations import discover_integrations
+from .integrations import discover_integrations, run_kicad_erc
 from .models import ProjectInput
 from .project_store import list_snapshots, load_circuit, restore_snapshot, save_circuit
 from .workflow import analyze, make_zip
@@ -23,7 +23,16 @@ ROOT = Path(__file__).resolve().parent.parent
 WEB = ROOT / "web"
 DATA_DIR = Path(os.environ.get("CIRCUITMIND_DATA_DIR", ROOT / "workspace")).expanduser().resolve()
 MAX_BODY = 1_000_000
+MAX_SCHEMATIC_BODY = 24_000_000
+MAX_SCHEMATIC_FILE = 12_000_000
 _CIRCUIT_API_LOCK = threading.RLock()
+_TOOL_LOCKS: dict[str, threading.Lock] = {}
+_TOOL_LOCKS_GUARD = threading.Lock()
+
+
+def _project_tool_lock(project_id: str) -> threading.Lock:
+    with _TOOL_LOCKS_GUARD:
+        return _TOOL_LOCKS.setdefault(project_id, threading.Lock())
 
 
 class RequestTooLarge(Exception):
@@ -131,6 +140,29 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         parts = path.strip("/").split("/")
+        if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["integrations", "kicad-erc"]:
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            with _project_tool_lock(project_id):
+                result = run_kicad_erc(folder)
+            with _CIRCUIT_API_LOCK:
+                _append_tool_run(folder, result)
+                _atomic_bytes(folder / "kicad_erc_result.json", (json.dumps(result, indent=2, ensure_ascii=False) + "\n").encode())
+                validation_path = folder / "validation_report.json"
+                validation = json.loads(validation_path.read_text("utf-8")) if validation_path.exists() else {"checks": {}, "findings": []}
+                checks = validation.setdefault("checks", {})
+                status = result.get("status", "not-run")
+                if status == "completed-no-messages":
+                    checks["electrical_rule_check"] = f"KiCad ERC completed; report summary: {result.get('erc_message_count')} messages"
+                else:
+                    checks["electrical_rule_check"] = f"KiCad ERC status: {status}"
+                _atomic_bytes(validation_path, (json.dumps(validation, indent=2, ensure_ascii=False) + "\n").encode())
+                _update_project_record(folder, validation)
+            return self._json(200, result)
         if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["circuit", "validate"]:
             project_id = parts[2]
             if not _valid_id(project_id):
@@ -196,6 +228,39 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PUT(self) -> None:
         parts = urlparse(self.path).path.strip("/").split("/")
+        if len(parts) == 4 and parts[:2] == ["api", "projects"] and parts[3] == "schematic":
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            try:
+                payload = self._read_payload(MAX_SCHEMATIC_BODY)
+                content = payload.get("content")
+                if not isinstance(content, str):
+                    raise ValueError("Schematic upload requires text field 'content'")
+                raw = content.encode("utf-8")
+                if len(raw) > MAX_SCHEMATIC_FILE:
+                    return self._json(413, {"error": "Schematic exceeds the 12 MB file limit"})
+                if not content.lstrip("\ufeff \t\r\n").startswith("(kicad_sch"):
+                    return self._json(422, {"error": "Expected a KiCad S-expression schematic beginning with (kicad_sch"})
+                target = folder / "user_source.kicad_sch"
+                with _project_tool_lock(project_id):
+                    if target.exists():
+                        return self._json(409, {"error": "A source schematic is already attached; overwrite is blocked to protect the imported original."})
+                    _atomic_bytes(target, raw)
+                    imported = {"status": "attached; not parsed or electrically validated", "file": target.name,
+                                "size_bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+                    _atomic_bytes(folder / "schematic_import.json", (json.dumps(imported, indent=2, ensure_ascii=False) + "\n").encode())
+                    _update_project_record(folder)
+                return self._json(201, imported)
+            except RequestTooLarge as exc:
+                return self._json(413, {"error": str(exc)})
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                return self._json(400, {"error": str(exc)})
+            except OSError as exc:
+                return self._json(500, {"error": f"Unable to attach schematic: {exc}"})
         if len(parts) != 4 or parts[:2] != ["api", "projects"] or parts[3] != "circuit":
             return self._json(404, {"error": "Not found"})
         project_id = parts[2]
@@ -224,15 +289,15 @@ class Handler(BaseHTTPRequestHandler):
         except OSError as exc:
             return self._json(500, {"error": f"Unable to save circuit model: {exc}"})
 
-    def _read_payload(self) -> dict[str, object]:
+    def _read_payload(self, max_bytes: int = MAX_BODY) -> dict[str, object]:
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError as exc:
             raise ValueError("Invalid Content-Length") from exc
         if length <= 0:
             raise ValueError("Request body must not be empty")
-        if length > MAX_BODY:
-            raise RequestTooLarge(f"Request exceeds the {MAX_BODY}-byte limit")
+        if length > max_bytes:
+            raise RequestTooLarge(f"Request exceeds the {max_bytes}-byte limit")
         payload = json.loads(self.rfile.read(length).decode("utf-8"))
         if not isinstance(payload, dict):
             raise ValueError("JSON request must be an object")
@@ -262,15 +327,29 @@ def _refresh_circuit_artifacts(project_id: str, folder: Path, model: dict[str, o
         checks["kicad_netlist_export"] = export_report["status"]
         checks["electrical_rule_check"] = "not-run (KiCad CLI/ERC not invoked)"
         _atomic_bytes(validation_path, (json.dumps(validation, indent=2, ensure_ascii=False) + "\n").encode())
-        project_path = folder / "project.json"
-        if project_path.exists():
-            record = json.loads(project_path.read_text("utf-8"))
-            record["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-            record["validation"] = validation
-            artifacts = {path.name for path in folder.iterdir() if path.is_file() and path.name != "project.json"}
-            record["artifacts"] = sorted(artifacts)
-            _atomic_bytes(project_path, (json.dumps(record, indent=2, ensure_ascii=False) + "\n").encode())
+        _update_project_record(folder, validation)
         return export_report
+
+
+def _append_tool_run(folder: Path, result: dict[str, object]) -> None:
+    log_path = folder / "tool_runs.jsonl"
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(result, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _update_project_record(folder: Path, validation: dict[str, object] | None = None) -> None:
+    project_path = folder / "project.json"
+    if not project_path.is_file():
+        return
+    record = json.loads(project_path.read_text("utf-8"))
+    record["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    if validation is not None:
+        record["validation"] = validation
+    artifacts = {path.name for path in folder.iterdir() if path.is_file() and path.name != "project.json"}
+    record["artifacts"] = sorted(artifacts)
+    _atomic_bytes(project_path, (json.dumps(record, indent=2, ensure_ascii=False) + "\n").encode())
 
 
 def _atomic_bytes(path: Path, data: bytes) -> None:

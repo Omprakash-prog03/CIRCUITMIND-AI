@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -6,6 +7,7 @@ import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
 import circuitmind.server as app_server
@@ -87,6 +89,25 @@ class CircuitApiTests(unittest.TestCase):
         code, report = self.call(f"/api/projects/{project_id}/artifact/kicad_export_report.json")
         self.assertEqual(code, 200)
         self.assertIn("blocked", report["content"])
+
+    def test_schematic_import_is_immutable_and_erc_unavailability_is_recorded(self):
+        _, created = self.call("/api/projects", {"name": "Existing KiCad", "description": "Continue schematic", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        code, imported = self.call(f"/api/projects/{project_id}/schematic", {"content": "(kicad_sch (version 20250101))\\n"}, "PUT")
+        self.assertEqual(code, 201)
+        self.assertEqual(imported["status"], "attached; not parsed or electrically validated")
+        code, duplicate = self.call(f"/api/projects/{project_id}/schematic", {"content": "(kicad_sch)"}, "PUT")
+        self.assertEqual(code, 409)
+        with patch.dict(os.environ, {"PATH": str(Path(self.temp.name) / "empty-path")}):
+            code, result = self.call(f"/api/projects/{project_id}/integrations/kicad-erc", method="POST")
+        self.assertEqual(code, 200)
+        self.assertEqual(result["status"], "unavailable")
+        code, log = self.call(f"/api/projects/{project_id}/artifact/tool_runs.jsonl")
+        self.assertEqual(code, 200)
+        self.assertIn("unavailable", log["content"])
+        code, artifact = self.call(f"/api/projects/{project_id}/artifact/user_source.kicad_sch")
+        self.assertEqual(code, 200)
+        self.assertIn("kicad_sch", artifact["content"])
 
     def test_invalid_model_is_rejected_without_snapshot(self):
         _, created = self.call("/api/projects", {"name": "API clock", "description": "Clock", "inventory": "", "architecture": "discrete"}, "POST")

@@ -17,11 +17,12 @@ The repository began as a README-only shell. Implement in vertical slices; each 
 - KiCad legacy XML netlist generation gated on explicit symbol IDs and consistent graph/pin declarations; no static image is passed off as a schematic.
 - Symbol library resolution against actual installed libraries, pinout provenance, visual schematic editor, and KiCad CLI/ERC execution remain unimplemented. This environment has no `kicad-cli`; generated netlist bytes are not CLI-validated.
 
-## Milestone 3 — Engineering integrations
+## Milestone 3 — Engineering integrations (KiCad ERC slice implemented; others pending)
 
-- Isolated, version-reporting adapters for KiCad ERC/DRC, ngspice, PlatformIO, Arduino CLI, and native compilers.
-- Run tools in a sandbox with timeouts, resource limits, allow-listed commands, captured logs, and deterministic test fixtures.
-- Never equate integration availability with successful validation; preserve raw output and exit status.
+- Read-only version probes remain separate from operations. A trusted local `kicad-cli sch erc` adapter is now available for a user-imported `.kicad_sch` file, with timeout, fixed argv/no shell, restricted child environment, captured output, unique reports, append-only run log, exit status, and explicit ERC-message parsing.
+- Imported schematics are size-limited, immutable via API, and not called validated until the real CLI operation runs. A zero process exit without a recognized zero-message summary is reported as unparsed, not clean.
+- This is not an OS/container sandbox; do not use it on untrusted project files. Resource limits beyond a wall-clock timeout and strong process isolation remain future work.
+- ngspice, PlatformIO, Arduino CLI, firmware compilation, KiCad DRC, and hardened sandboxing remain unimplemented. Missing tools report unavailable; a version probe is not a test result.
 
 ## Milestone 4 — Datasheets, component library, calculations
 

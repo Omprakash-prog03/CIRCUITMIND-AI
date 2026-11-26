@@ -1,6 +1,6 @@
 # CIRCUITMIND AI
 
-CIRCUITMIND AI is a local engineering workbench for turning electronics requirements and supplied inventories into traceable project data. **Milestone 2 is implemented:** deterministic intake/feasibility, a versioned circuit graph with a JSON editor, graph validation, revision snapshots/restore, and a gated KiCad XML netlist exporter.
+CIRCUITMIND AI is a local engineering workbench for turning electronics requirements and supplied inventories into traceable project data. **Implemented slices:** deterministic intake/feasibility, a versioned circuit graph with a JSON editor, graph validation, revision snapshots/restore, a gated KiCad XML netlist exporter, and a real KiCad schematic-ERC adapter for user-imported schematic files when KiCad CLI is installed.
 
 ## Run
 
@@ -27,12 +27,13 @@ The server is intended for local use. It does not expose code execution or store
 - The UI can edit this JSON model, ask the server for graph/schema checks, save revisions, and restore an earlier snapshot.
 - KiCad XML netlist output is generated only when the model has components, consistent declared pins/nets, and caller-supplied symbol IDs. It is not a schematic export.
 - ZIP exports include revision snapshots and project artifacts.
+- A user can attach an existing `.kicad_sch` (immutable through the API) and request KiCad CLI schematic ERC. Runs retain the CLI exit code/output, report, timestamped run identifier, and append-only `tool_runs.jsonl` entry.
 
-API routes for the model are `GET /api/projects/<id>/circuit`, `POST /api/projects/<id>/circuit/validate`, `PUT /api/projects/<id>/circuit`, `GET /api/projects/<id>/snapshots`, and `POST /api/projects/<id>/snapshots/restore` with `{"snapshot_id":"..."}`. Saving a model snapshots the prior version first. Unsupported model versions fail closed; schema v1 projects are migrated to v2 without inferred symbol IDs.
+API routes for the model are `GET /api/projects/<id>/circuit`, `POST /api/projects/<id>/circuit/validate`, `PUT /api/projects/<id>/circuit`, `GET /api/projects/<id>/snapshots`, and `POST /api/projects/<id>/snapshots/restore` with `{"snapshot_id":"..."}`. Existing schematic operations are `PUT /api/projects/<id>/schematic` with a JSON `content` string and `POST /api/projects/<id>/integrations/kicad-erc`. Saving a model snapshots the prior version first. Unsupported model versions fail closed; schema v1 projects are migrated to v2 without inferred symbol IDs.
 
 ## Engineering limits (important)
 
-Graph validation checks references, pin existence, duplicate assignments, and model structure only. It does **not** establish electrical correctness, datasheet provenance, symbol-library validity, ERC/DRC, or a physically drawable/editable KiCad schematic. The generated KiCad legacy XML netlist is not run through KiCad in this environment because `kicad-cli` is not installed. ESP32 firmware generation/compilation, SPICE simulation, PCB design, hardware testing, and manufacturing checks are not implemented. Validation artifacts distinguish these unrun checks; do not interpret a graph pass or netlist file as electrical approval.
+Graph validation checks references, pin existence, duplicate assignments, and model structure only. It does **not** establish electrical correctness, datasheet provenance, symbol-library validity, ERC/DRC, or a physically drawable/editable KiCad schematic. The XML netlist candidate is not run through KiCad here because `kicad-cli` is not installed. The ERC adapter invokes a trusted local CLI on an explicitly imported schematic when available; it uses a timeout and no shell, but **is not an OS/container sandbox**, so only import files you trust. ngspice/firmware compilation, PCB design, hardware testing, and manufacturing checks are not implemented. Validation artifacts distinguish these unrun checks; do not interpret a graph pass or netlist file as electrical approval.
 
 The clock benchmark intentionally reports that the sample inventory is insufficient for the discrete six-digit design (including only three CD4511 display drivers) and does not invent pin wiring. Calculation examples are illustrative, not approved design values.
 

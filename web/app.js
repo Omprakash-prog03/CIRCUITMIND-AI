@@ -47,7 +47,7 @@ function renderResult(project) {
   const inventoryRows = (project.inventory || []).map((item) => `<tr><td>${escapeHtml(item.name)}</td><td>${escapeHtml(item.quantity ?? 'unspecified')}</td><td>Unverified</td></tr>`).join('');
   const statusLines = Object.entries(checks).map(([name, status]) => `<div class="validation-line"><span>${escapeHtml(name.replaceAll('_',' '))}</span><span>${escapeHtml(status)}</span></div>`).join('');
   const artifactButtons = (project.artifacts || []).map((name) => `<button class="artifact-button" data-artifact="${escapeHtml(name)}">↗ &nbsp;${escapeHtml(name)}</button>`).join('');
-  $('#view-result').innerHTML = `<div class="result-top"><div class="eyebrow"><span class="eyebrow-line"></span> ENGINEERING INTAKE COMPLETE</div><h1>${escapeHtml(project.name)}</h1><p>${escapeHtml(project.architecture)} architecture · Created ${escapeHtml(new Date(project.created_at).toLocaleString())}</p><div class="result-actions"><a class="primary-button" href="/api/projects/${encodeURIComponent(project.project_id)}/export"><span>Download project ZIP</span><span class="button-arrow">↓</span></a><button class="small-button" id="edit-circuit">Edit circuit model</button><button class="small-button" id="show-snapshots">Snapshots</button><button class="small-button" id="back-to-brief">← New analysis</button></div></div>
+  $('#view-result').innerHTML = `<div class="result-top"><div class="eyebrow"><span class="eyebrow-line"></span> ENGINEERING INTAKE COMPLETE</div><h1>${escapeHtml(project.name)}</h1><p>${escapeHtml(project.architecture)} architecture · Created ${escapeHtml(new Date(project.created_at).toLocaleString())}</p><div class="result-actions"><a class="primary-button" href="/api/projects/${encodeURIComponent(project.project_id)}/export"><span>Download project ZIP</span><span class="button-arrow">↓</span></a><button class="small-button" id="edit-circuit">Edit circuit model</button><button class="small-button" id="import-schematic">Import KiCad schematic</button><button class="small-button" id="run-kicad-erc">Run KiCad ERC</button><button class="small-button" id="show-snapshots">Snapshots</button><button class="small-button" id="back-to-brief">← New analysis</button></div></div>
   <div class="status-banner">⚠ &nbsp; Incomplete — this is requirements and feasibility analysis, not a completed electrical design.</div>
   <div class="result-grid"><div><section class="result-panel"><h2>Feasibility findings <span class="optional">${findings.length} ITEMS</span></h2>${findings.map((finding) => `<div class="finding"><span class="finding-icon">!</span><span>${escapeHtml(finding)}</span></div>`).join('')}</section>
   <section class="result-panel"><h2>Supplied component inventory</h2>${inventoryRows ? `<table class="inventory-table"><thead><tr><th>PART / DESCRIPTION</th><th>QTY</th><th>VERIFICATION</th></tr></thead><tbody>${inventoryRows}</tbody></table>` : '<div class="empty-state">No inventory provided.</div>'}</section></div>
@@ -55,6 +55,8 @@ function renderResult(project) {
   $('#view-result').querySelectorAll('[data-artifact]').forEach((button) => button.addEventListener('click', () => openArtifact(project.project_id, button.dataset.artifact)));
   $('#back-to-brief').addEventListener('click', () => showView('new'));
   $('#edit-circuit').addEventListener('click', openCircuitEditor);
+  $('#import-schematic').addEventListener('click', () => $('#schematic-file').click());
+  $('#run-kicad-erc').addEventListener('click', runKiCadErc);
   $('#show-snapshots').addEventListener('click', showSnapshots);
   showView('result');
 }
@@ -118,6 +120,31 @@ async function showSnapshots() {
   } catch (error) { toast(error.message); }
 }
 
+async function importSchematicFile(file) {
+  if (!file) return;
+  if (!file.name.toLowerCase().endsWith('.kicad_sch')) { toast('Choose a .kicad_sch file.'); return; }
+  if (file.size > 12_000_000) { toast('Schematic exceeds the 12 MB limit.'); return; }
+  try {
+    const content = await file.text();
+    const response = await fetch(`/api/projects/${encodeURIComponent(currentProject.project_id)}/schematic`, {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({content})});
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `Import failed (${response.status})`);
+    await refreshProject(currentProject.project_id);
+    toast('Schematic attached. It has not been parsed or checked yet.');
+  } catch (error) { toast(error.message); }
+}
+async function runKiCadErc() {
+  if (!currentProject) return;
+  try {
+    const response = await fetch(`/api/projects/${encodeURIComponent(currentProject.project_id)}/integrations/kicad-erc`, {method:'POST'});
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || `ERC request failed (${response.status})`);
+    await refreshProject(currentProject.project_id);
+    const detail = result.status === 'completed-no-messages' ? 'KiCad report summary: 0 messages.' : `KiCad ERC status: ${result.status}.`;
+    toast(`${detail} See kicad_erc_result.json for captured evidence.`);
+  } catch (error) { toast(error.message); }
+}
+
 async function loadTools() {
   try {
     const data = await (await request('/api/integrations')).json();
@@ -151,6 +178,10 @@ $('#dialog-close').addEventListener('click', () => $('#artifact-dialog').close()
 $('#artifact-dialog').addEventListener('click', (event) => { if (event.target === $('#artifact-dialog')) $('#artifact-dialog').close(); });
 document.querySelectorAll('[data-close]').forEach((button) => button.addEventListener('click', () => $(`#${button.dataset.close}`).close()));
 $('#validate-circuit').addEventListener('click', validateCircuitDraft);
+$('#schematic-file').addEventListener('change', (event) => {
+  const file = event.target.files?.[0]; event.target.value = '';
+  importSchematicFile(file);
+});
 $('#circuit-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   try {
