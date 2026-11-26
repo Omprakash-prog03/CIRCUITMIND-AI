@@ -112,6 +112,31 @@ class CircuitApiTests(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertIn("kicad_sch", artifact["content"])
 
+    def test_board_import_archives_replacement_and_drc_attempt_is_recorded(self):
+        _, created = self.call("/api/projects", {"name": "PCB DRC API", "description": "Continue an existing board", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        board = "(kicad_pcb (version 20250101))\\n"
+        code, imported = self.call(f"/api/projects/{project_id}/board", {"content": board}, "PUT")
+        self.assertEqual(code, 201)
+        self.assertIn("header checked only", imported["status"])
+        code, duplicate = self.call(f"/api/projects/{project_id}/board", {"content": board}, "PUT")
+        self.assertEqual(code, 409)
+        code, replaced = self.call(f"/api/projects/{project_id}/board", {"content": board + "\\n", "replace": True}, "PUT")
+        self.assertEqual(code, 201)
+        self.assertTrue(replaced["previous_file"].startswith("user_source.previous-"))
+        with patch.dict(os.environ, {"PATH": str(Path(self.temp.name) / "empty-path")}):
+            code, result = self.call(f"/api/projects/{project_id}/integrations/kicad-drc", method="POST")
+        self.assertEqual(code, 200)
+        self.assertEqual(result["status"], "unavailable")
+        code, report = self.call(f"/api/projects/{project_id}/artifact/kicad_drc_result.json")
+        self.assertEqual(code, 200)
+        self.assertIn("unavailable", report["content"])
+        code, validation = self.call(f"/api/projects/{project_id}/artifact/validation_report.json")
+        self.assertEqual(code, 200)
+        self.assertIn("pcb_design_rule_check", validation["content"])
+        code, bad = self.call(f"/api/projects/{project_id}/board", {"content": "not a board"}, "PUT")
+        self.assertEqual(code, 422)
+
     def test_spice_deck_import_requires_static_allowlist_and_simulation_is_logged(self):
         _, created = self.call("/api/projects", {"name": "SPICE API", "description": "RC transient test", "inventory": "", "architecture": "discrete"}, "POST")
         project_id = created["project_id"]

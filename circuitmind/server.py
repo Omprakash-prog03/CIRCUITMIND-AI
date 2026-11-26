@@ -14,7 +14,7 @@ from urllib.parse import unquote, urlparse
 
 from . import __version__
 from .circuit_schema import export_kicad_netlist, migrate_model, validate_model
-from .integrations import discover_integrations, run_kicad_erc, run_ngspice
+from .integrations import discover_integrations, run_kicad_drc, run_kicad_erc, run_ngspice
 from .spice import validate_spice_deck
 from .models import ProjectInput
 from .project_store import list_snapshots, load_circuit, restore_snapshot, save_circuit
@@ -172,6 +172,33 @@ class Handler(BaseHTTPRequestHandler):
                 _atomic_bytes(validation_path, (json.dumps(validation, indent=2, ensure_ascii=False) + "\n").encode())
                 _update_project_record(folder, validation)
             return self._json(200, result)
+        if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["integrations", "kicad-drc"]:
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            with _project_tool_lock(project_id):
+                result = run_kicad_drc(folder)
+            with _CIRCUIT_API_LOCK:
+                _append_tool_run(folder, result)
+                _atomic_bytes(folder / "kicad_drc_result.json", (json.dumps(result, indent=2, ensure_ascii=False) + "\n").encode())
+                validation_path = folder / "validation_report.json"
+                validation = json.loads(validation_path.read_text("utf-8")) if validation_path.exists() else {"checks": {}, "findings": []}
+                status = result.get("status", "not-run")
+                violations = result.get("drc_violation_count")
+                unconnected = result.get("unconnected_pad_count")
+                if status == "completed-no-reported-violations":
+                    summary = f"KiCad board DRC completed; reported {violations} violations and {unconnected} unconnected pads"
+                elif status == "completed-with-violations":
+                    summary = f"KiCad board DRC reported violations: {violations}; unconnected pads: {unconnected}"
+                else:
+                    summary = f"KiCad board DRC status: {status}"
+                validation.setdefault("checks", {})["pcb_design_rule_check"] = summary
+                _atomic_bytes(validation_path, (json.dumps(validation, indent=2, ensure_ascii=False) + "\n").encode())
+                _update_project_record(folder, validation)
+            return self._json(200, result)
         if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["integrations", "kicad-erc"]:
             project_id = parts[2]
             if not _valid_id(project_id):
@@ -260,9 +287,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PUT(self) -> None:
         parts = urlparse(self.path).path.strip("/").split("/")
-        if len(parts) == 4 and parts[:2] == ["api", "projects"] and parts[3] in {"schematic", "simulation-deck"}:
+        if len(parts) == 4 and parts[:2] == ["api", "projects"] and parts[3] in {"schematic", "simulation-deck", "board"}:
             project_id = parts[2]
             is_schematic = parts[3] == "schematic"
+            is_board = parts[3] == "board"
             if not _valid_id(project_id):
                 return self._json(400, {"error": "Invalid project id"})
             folder = DATA_DIR / "projects" / project_id
@@ -281,6 +309,12 @@ class Handler(BaseHTTPRequestHandler):
                         return self._json(422, {"error": "Expected a KiCad S-expression schematic beginning with (kicad_sch"})
                     source_name, import_report_name = "user_source.kicad_sch", "schematic_import.json"
                     import_status = "attached; not parsed or electrically validated"
+                    static_report = None
+                elif is_board:
+                    if not content.lstrip("\ufeff \t\r\n").startswith("(kicad_pcb"):
+                        return self._json(422, {"error": "Expected a KiCad S-expression PCB beginning with (kicad_pcb"})
+                    source_name, import_report_name = "user_source.kicad_pcb", "board_import.json"
+                    import_status = "attached; header checked only; not parsed, electrically checked, or manufacturing validated"
                     static_report = None
                 else:
                     static_report = validate_spice_deck(content)

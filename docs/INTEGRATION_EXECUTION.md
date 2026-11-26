@@ -7,6 +7,13 @@
 3. Outcomes are separate: `unavailable`, `not-run`, `timeout`, `failed`, `failed-to-start`, `completed-unparsed`, `completed-with-messages`, or `completed-no-messages`. Exit code zero alone is not considered clean. A recognized `ERC messages: 0` report summary is required to record zero messages.
 4. `validation_report.json` stores the operation outcome, not an assertion of hardware or manufacturing correctness. ERC on a schematic is not PCB DRC or electrical bench validation.
 
+## KiCad board DRC (implemented adapter)
+
+1. Attach an existing `.kicad_pcb` through the UI or `PUT /api/projects/<id>/board` with JSON `{ "content": "..." }`. The API checks the S-expression header, limits source to 12 MB, records SHA-256, and requires explicit replacement confirmation while archiving the previous board. This is **not** a complete parse or board validation.
+2. Request `POST /api/projects/<id>/integrations/kicad-drc`. The adapter runs fixed argv (`kicad-cli pcb drc --output <report> <board>`) without a shell, with a 120-second timeout and bounded captured output, then preserves the input board SHA-256, a unique report, `kicad_drc_result.json`, and an append-only `tool_runs.jsonl` entry.
+3. Outcomes include `unavailable`, `not-run`, `timeout`, `failed`, `failed-to-start`, `completed-unparsed`, `completed-with-violations`, and `completed-no-reported-violations`. A zero exit is not clean by itself: the report must include explicit counts for both DRC violations and unconnected pads, and both must be zero for the no-reported-violations status.
+4. This status reflects only KiCad's report for the imported board. It does not establish electrical design correctness, successful fabrication, manufacturing-rule suitability, assembly quality, or hardware operation. Review the report and confirm board-specific constraints separately.
+
 ## ngspice batch simulation (implemented adapter)
 
 1. Attach a `.cir`, `.sp`, or `.ckt` netlist through `PUT /api/projects/<id>/simulation-deck` with JSON `{ "content": "..." }`. The source is size-limited, checked against a conservative directive allowlist before storage, and its replacement requires confirmation with the previous deck archived.
@@ -20,4 +27,4 @@ Both adapters use fixed commands without shell, wall-clock timeouts, bounded cap
 
 ## Other tool status
 
-`GET /api/integrations` only probes executable availability/version. It runs no ERC, simulation, or compilation. This workspace has neither `kicad-cli` nor `ngspice`, so no real ERC or simulation has been performed here. Adapter regression tests use temporary controlled executables to verify argv, timeout, output capture, and status interpretation; they are not real engineering-tool results. PlatformIO, Arduino CLI build, firmware compilation, KiCad DRC, and other integrations remain pending.
+`GET /api/integrations` only probes executable availability/version. It runs no ERC, DRC, simulation, or compilation. This workspace has neither `kicad-cli` nor `ngspice`, so no real ERC, DRC, or simulation has been performed here. Adapter regression tests use temporary controlled executables to verify argv, timeout, output capture, and status interpretation; they are not real engineering-tool results. PlatformIO, Arduino CLI build, firmware compilation, and other integrations remain pending.

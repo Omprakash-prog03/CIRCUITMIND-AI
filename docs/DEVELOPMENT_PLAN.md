@@ -17,12 +17,13 @@ The repository began as a README-only shell. Implement in vertical slices; each 
 - KiCad legacy XML netlist generation gated on explicit symbol IDs and consistent graph/pin declarations; no static image is passed off as a schematic.
 - Symbol library resolution against actual installed libraries, pinout provenance, visual schematic editor, and KiCad CLI/ERC execution remain unimplemented. This environment has no `kicad-cli`; generated netlist bytes are not CLI-validated.
 
-## Milestone 3 — Engineering integrations (KiCad ERC + ngspice adapters implemented; others pending)
+## Milestone 3 — Engineering integrations (KiCad ERC/DRC + ngspice adapters implemented; others pending)
 
-- Read-only version probes remain separate from operations. The `kicad-cli sch erc` adapter accepts a user-imported `.kicad_sch`; the ngspice adapter accepts a restricted batch deck and runs `ngspice -b -r ...`.
-- Both operations use fixed argv/no shell, timeouts, restricted child environment, bounded captured logs, source uploads with confirmed replacement archiving, unique reports, an append-only run log, and evidence-based outcome interpretation. SPICE control/file-execution directives are rejected before invocation; raw result downloads are supported with a 64 MB post-run cap.
+- Read-only version probes remain separate from operations. KiCad CLI adapters operate on explicitly imported `.kicad_sch` and `.kicad_pcb` source files; ngspice accepts a restricted batch deck and runs `ngspice -b -r ...`.
+- Operations use fixed argv/no shell, timeouts, restricted child environment, bounded captured logs, source uploads with confirmed replacement archiving, unique reports, an append-only run log, and evidence-based outcome interpretation. SPICE control/file-execution directives are rejected before invocation; raw result downloads are supported with a 64 MB post-run cap. PCB attachment checks only its header and does not parse or validate the design.
+- DRC is reported clean only when the CLI exits successfully and both explicit zero DRC violation and zero unconnected-pad counts are parsed. A DRC result is not electrical correctness, hardware validation, or manufacturing readiness.
 - These are not OS/container sandboxes; do not run against untrusted files. CPU/memory/filesystem quotas and stronger process isolation remain future work. Input filtering cannot prove parser safety.
-- PlatformIO, Arduino CLI, firmware compilation, KiCad DRC, real tool execution in this environment, and hardened sandboxing remain unimplemented/unavailable. Tool probes are not validation results.
+- PlatformIO, Arduino CLI, firmware compilation, real native-tool execution in this environment, and hardened sandboxing remain unimplemented/unavailable. Tool probes are not validation results.
 
 ## Milestone 4 — Datasheets, component library, calculations
 

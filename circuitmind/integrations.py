@@ -256,3 +256,88 @@ def run_ngspice(project_dir: Path, timeout_seconds: float = 60.0) -> dict[str, A
             return {"tool": "ngspice batch simulation", "run_id": run_id, "started_at": started_at,
                     "status": "failed-to-start", "exit_code": None, "reason": f"Unable to start ngspice: {exc}",
                     "deck_validation": static_check, "input_sha256": deck_sha256}
+
+
+def run_kicad_drc(project_dir: Path, timeout_seconds: float = 120.0) -> dict[str, Any]:
+    """Run KiCad board DRC on an explicitly imported PCB, preserving outcome evidence."""
+    project_dir = project_dir.resolve()
+    started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+    board = (project_dir / "user_source.kicad_pcb").resolve()
+    if board.parent != project_dir or not board.is_file():
+        return {"tool": "KiCad CLI board DRC", "run_id": run_id, "started_at": started_at,
+                "status": "not-run", "reason": "No imported user_source.kicad_pcb exists."}
+    if board.stat().st_size > 12_000_000:
+        return {"tool": "KiCad CLI board DRC", "run_id": run_id, "started_at": started_at,
+                "status": "not-run", "reason": "PCB file exceeds 12 MB limit."}
+    try:
+        with board.open("r", encoding="utf-8-sig", errors="strict") as handle:
+            if not handle.read(256).lstrip().startswith("(kicad_pcb"):
+                return {"tool": "KiCad CLI board DRC", "run_id": run_id, "started_at": started_at,
+                        "status": "not-run", "reason": "Imported file header is not a KiCad PCB board."}
+    except (OSError, UnicodeError) as exc:
+        return {"tool": "KiCad CLI board DRC", "run_id": run_id, "started_at": started_at,
+                "status": "not-run", "reason": f"PCB file could not be read: {exc}"}
+    board_sha256 = hashlib.sha256(board.read_bytes()).hexdigest()
+    executable = shutil.which("kicad-cli")
+    if not executable:
+        return {"tool": "KiCad CLI board DRC", "run_id": run_id, "started_at": started_at,
+                "status": "unavailable", "board_sha256": board_sha256,
+                "reason": "kicad-cli was not found on PATH; no DRC was run."}
+    executable = str(Path(executable).resolve())
+    report_path = project_dir / f"kicad_drc_report_{run_id}.txt"
+    with tempfile.TemporaryDirectory(prefix="circuitmind-kicad-drc-", dir=project_dir) as temp_dir:
+        sandbox = Path(temp_dir)
+        home = sandbox / "home"
+        home.mkdir()
+        env = {"PATH": os.environ.get("PATH", ""), "HOME": str(home), "TMP": str(sandbox),
+               "TEMP": str(sandbox), "TMPDIR": str(sandbox)}
+        command = [executable, "pcb", "drc", "--output", str(report_path), str(board)]
+        try:
+            exit_code, stdout, stderr = _run_bounded(command, sandbox, env, timeout_seconds)
+            report = ""
+            if report_path.is_file():
+                with report_path.open("r", encoding="utf-8", errors="replace") as handle:
+                    report = handle.read(2_000_000)
+            if not report:
+                report = stdout or stderr
+                report_path.write_text(report, encoding="utf-8")
+            violation_match = re.search(r"(?i)(?:found\s+)?(\d+)\s+(?:PCB\s+)?DRC\s+violations|(?:DRC\s+)?violations\s*:\s*(\d+)", report)
+            unconnected_match = re.search(r"(?i)(?:found\s+)?(\d+)\s+unconnected\s+pads|unconnected\s+pads\s*:\s*(\d+)", report)
+            violations = _first_group_int(violation_match)
+            unconnected = _first_group_int(unconnected_match)
+            if exit_code != 0:
+                status = "failed"
+            elif (violations is not None and violations > 0) or (unconnected is not None and unconnected > 0):
+                status = "completed-with-violations"
+            elif violations == 0 and unconnected == 0:
+                status = "completed-no-reported-violations"
+            else:
+                status = "completed-unparsed"
+            return {"tool": "KiCad CLI board DRC", "run_id": run_id, "started_at": started_at,
+                    "status": status, "exit_code": exit_code, "board_sha256": board_sha256,
+                    "drc_violation_count": violations, "unconnected_pad_count": unconnected, "command": command,
+                    "report_file": report_path.name, "report": report[-128_000:],
+                    "stdout": stdout, "stderr": stderr,
+                    "interpretation": "A zero exit alone is not considered DRC-clean; explicit violation and unconnected-pad summaries are required."}
+        except subprocess.TimeoutExpired as exc:
+            stdout, stderr = _as_text(exc.stdout)[-64_000:], _as_text(exc.stderr)[-64_000:]
+            report = report_path.read_text("utf-8", errors="replace")[-128_000:] if report_path.is_file() else ""
+            return {"tool": "KiCad CLI board DRC", "run_id": run_id, "started_at": started_at,
+                    "status": "timeout", "exit_code": None, "board_sha256": board_sha256,
+                    "report_file": report_path.name if report else None,
+                    "report": report, "stdout": stdout, "stderr": stderr,
+                    "reason": f"DRC exceeded {timeout_seconds:g} seconds; partial output retained."}
+        except OSError as exc:
+            return {"tool": "KiCad CLI board DRC", "run_id": run_id, "started_at": started_at,
+                    "status": "failed-to-start", "exit_code": None, "board_sha256": board_sha256,
+                    "reason": f"Unable to start KiCad CLI: {exc}"}
+
+
+def _first_group_int(match: re.Match[str] | None) -> int | None:
+    if not match:
+        return None
+    for group in match.groups():
+        if group is not None:
+            return int(group)
+    return None

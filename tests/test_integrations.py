@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from circuitmind.integrations import run_kicad_erc, run_ngspice
+from circuitmind.integrations import run_kicad_drc, run_kicad_erc, run_ngspice
 from circuitmind.spice import validate_spice_deck
 
 
@@ -160,6 +160,74 @@ sys.exit({exit_code})
         malformed = run_kicad_erc(self.project)
         self.assertEqual(malformed["status"], "not-run")
         self.assertIn("header", malformed["reason"])
+
+
+class KiCadDrcIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.project = Path(self.temp.name) / "project"
+        self.project.mkdir()
+        (self.project / "user_source.kicad_pcb").write_text('(kicad_pcb (version 20250101))\n', "utf-8")
+        self.bin = Path(self.temp.name) / "bin"
+        self.bin.mkdir()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def fake_cli(self, report="Found 0 DRC violations\nUnconnected pads: 0\n", exit_code=0, sleep_seconds=0):
+        executable = self.bin / "kicad-cli"
+        script = f'''#!{os.sys.executable}
+import pathlib, sys, time
+if {sleep_seconds!r}: time.sleep({sleep_seconds!r})
+pathlib.Path(sys.argv[4]).write_text({report!r}, encoding="utf-8")
+sys.exit({exit_code})
+'''
+        executable.write_text(script, "utf-8")
+        executable.chmod(0o755)
+        return executable
+
+    def test_zero_counts_required_and_fixed_command_recorded(self):
+        self.fake_cli()
+        with patch.dict(os.environ, {"PATH": str(self.bin)}):
+            result = run_kicad_drc(self.project)
+        self.assertEqual(result["status"], "completed-no-reported-violations")
+        self.assertEqual(result["drc_violation_count"], 0)
+        self.assertEqual(result["unconnected_pad_count"], 0)
+        self.assertEqual(len(result["board_sha256"]), 64)
+        self.assertEqual(result["command"][1:3], ["pcb", "drc"])
+        self.assertTrue((self.project / result["report_file"]).exists())
+
+    def test_violations_nonzero_exit_and_unparsed_zero_exit_remain_distinct(self):
+        self.fake_cli("Found 2 DRC violations\nUnconnected pads: 1\n")
+        with patch.dict(os.environ, {"PATH": str(self.bin)}):
+            result = run_kicad_drc(self.project)
+        self.assertEqual(result["status"], "completed-with-violations")
+        self.assertEqual(result["drc_violation_count"], 2)
+        self.assertEqual(result["unconnected_pad_count"], 1)
+        self.fake_cli("No structured summary\n", exit_code=0)
+        with patch.dict(os.environ, {"PATH": str(self.bin)}):
+            unparsed = run_kicad_drc(self.project)
+        self.assertEqual(unparsed["status"], "completed-unparsed")
+        self.assertIsNone(unparsed["drc_violation_count"])
+        self.fake_cli("Found 0 DRC violations\nUnconnected pads: 0\n", exit_code=1)
+        with patch.dict(os.environ, {"PATH": str(self.bin)}):
+            failed = run_kicad_drc(self.project)
+        self.assertEqual(failed["status"], "failed")
+
+    def test_missing_tool_missing_board_bad_header_and_timeout(self):
+        with patch.dict(os.environ, {"PATH": str(self.bin)}):
+            self.assertEqual(run_kicad_drc(self.project)["status"], "unavailable")
+        (self.project / "user_source.kicad_pcb").unlink()
+        self.assertEqual(run_kicad_drc(self.project)["status"], "not-run")
+        (self.project / "user_source.kicad_pcb").write_text("not a board", "utf-8")
+        malformed = run_kicad_drc(self.project)
+        self.assertEqual(malformed["status"], "not-run")
+        self.assertIn("header", malformed["reason"])
+        (self.project / "user_source.kicad_pcb").write_text("(kicad_pcb)", "utf-8")
+        self.fake_cli(sleep_seconds=.2)
+        with patch.dict(os.environ, {"PATH": str(self.bin)}):
+            timeout = run_kicad_drc(self.project, timeout_seconds=.02)
+        self.assertEqual(timeout["status"], "timeout")
 
 
 if __name__ == "__main__":
