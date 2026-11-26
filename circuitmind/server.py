@@ -16,7 +16,7 @@ from . import __version__
 from .circuit_schema import export_kicad_netlist, migrate_model, validate_model
 from .integrations import discover_integrations, run_kicad_drc, run_kicad_erc, run_ngspice, run_pdftotext
 from .kicad_symbols import resolve_kicad_symbol
-from .engineering import clock_divider_candidate, clock_timebase_error, led_series_resistor
+from .engineering import clock_divider_candidate, clock_timebase_error, led_series_resistor, solve_dc_operating_point
 from .spice import validate_spice_deck
 from .models import ProjectInput
 from .project_store import list_snapshots, load_circuit, restore_snapshot, save_circuit
@@ -102,6 +102,36 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"circuit_model_sha256": current_hash, "calculations": reports})
             except (OSError, json.JSONDecodeError, ValueError) as exc:
                 return self._json(500, {"error": f"Calculation history could not be read: {exc}"})
+        if len(parts) == 4 and parts[:2] == ["api", "projects"] and parts[3] == "simulations":
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            try:
+                model = load_circuit(folder)
+                current_hash = hashlib.sha256(json.dumps(model, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+                runs = []
+                for report_path in folder.glob("simulation_mna_*.json"):
+                    report = json.loads(report_path.read_text("utf-8"))
+                    netlist = report.get("input_netlist")
+                    recorded_netlist_hash = report.get("netlist_sha256")
+                    if not isinstance(netlist, dict):
+                        netlist_status = "missing-netlist"
+                    else:
+                        actual_netlist_hash = hashlib.sha256(json.dumps(netlist, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+                        netlist_status = "intact" if actual_netlist_hash == recorded_netlist_hash else "hash-mismatch"
+                    runs.append({"run_id": report.get("run_id"), "kind": report.get("kind"),
+                                 "created_at": report.get("created_at"), "artifact": report_path.name,
+                                 "model_status": "same-at-run" if report.get("circuit_model_sha256") == current_hash else "model-changed-since-run",
+                                 "netlist_status": netlist_status, "netlist_sha256": recorded_netlist_hash,
+                                 "circuit_model_sha256": report.get("circuit_model_sha256"),
+                                 "outputs": report.get("calculation", {}).get("outputs", {})})
+                runs.sort(key=lambda item: (item.get("created_at", ""), item.get("run_id", "")))
+                return self._json(200, {"current_circuit_model_sha256": current_hash, "simulations": runs})
+            except (OSError, json.JSONDecodeError, ValueError, TypeError) as exc:
+                return self._json(500, {"error": f"Simulation history could not be read: {exc}"})
         if len(parts) == 4 and parts[:2] == ["api", "projects"] and parts[3] == "datasheets":
             project_id = parts[2]
             if not _valid_id(project_id):
@@ -198,6 +228,50 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         parts = path.strip("/").split("/")
+        if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["simulations", "dc-operating-point"]:
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            try:
+                payload = self._read_payload(200_000)
+                netlist = payload.get("netlist")
+                if not isinstance(netlist, dict):
+                    raise ValueError("Request must include an explicit 'netlist' object")
+                calculation = solve_dc_operating_point(netlist)
+                normalized_netlist = json.loads(json.dumps(netlist, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False))
+                netlist_hash = hashlib.sha256(json.dumps(normalized_netlist, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+                with _project_tool_lock(project_id), _CIRCUIT_API_LOCK:
+                    model = load_circuit(folder)
+                    topology = validate_model(model)
+                    if not topology["topology_valid"]:
+                        return self._json(409, {"error": "Saved circuit model is invalid; operating-point report is not attached to an invalid revision", "topology_report": topology})
+                    model_hash = hashlib.sha256(json.dumps(model, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+                    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+                    report_name = f"simulation_mna_{run_id}.json"
+                    created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    report = {"run_id": run_id, "kind": "linear_dc_mna_operating_point", "created_at": created_at,
+                              "circuit_model_sha256": model_hash, "netlist_sha256": netlist_hash,
+                              "model_association": "user-associated saved-model revision; netlist was not generated from or matched to the circuit graph",
+                              "input_values_source": "explicit user-supplied linear DC netlist; no component data inferred",
+                              "calculation": calculation, "input_netlist": normalized_netlist, "artifact": report_name}
+                    _atomic_bytes(folder / report_name, (json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode())
+                    with (folder / "simulation_runs.jsonl").open("a", encoding="utf-8") as log:
+                        log.write(json.dumps({"run_id": run_id, "kind": report["kind"], "created_at": created_at,
+                                              "circuit_model_sha256": model_hash, "netlist_sha256": netlist_hash,
+                                              "artifact": report_name}, ensure_ascii=False, allow_nan=False) + "\n")
+                        log.flush()
+                        os.fsync(log.fileno())
+                    _update_project_record(folder)
+                return self._json(201, report)
+            except RequestTooLarge as exc:
+                return self._json(413, {"error": str(exc)})
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+                return self._json(422, {"error": str(exc)})
+            except OSError as exc:
+                return self._json(500, {"error": f"DC operating-point report could not be stored: {exc}"})
         if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["calculations", "clock-divider"]:
             project_id = parts[2]
             if not _valid_id(project_id):

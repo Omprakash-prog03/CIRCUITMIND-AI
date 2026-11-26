@@ -2,7 +2,7 @@
 
 ## Current implemented scope
 
-`circuitmind.engineering` is a pure-Python calculation library. It does not invoke ngspice or infer values from a component label. Project-linked workflows include a bounded DC LED-series-resistor analysis, a nearest-integer clock-divider candidate, and a clock timebase rate-error budget, accompanied by foundational Ohm's law, resistor/capacitor series-parallel networks, RC time constant, and ideal capacitor/inductor energy calculations.
+`circuitmind.engineering` is a pure-Python calculation library. It does not invoke ngspice or infer values from a component label. Project-linked workflows include a bounded DC LED-series-resistor analysis, a nearest-integer clock-divider candidate, a clock timebase rate-error budget, and a small explicit-netlist linear DC modified-nodal-analysis (MNA) operating-point solver, accompanied by foundational Ohm's law, resistor/capacitor series-parallel networks, RC time constant, and ideal capacitor/inductor energy calculations.
 
 Every quantity is entered as `{ "value": number, "unit": "..." }`. Supported input unit conversions are explicit and dimension-checked. Values are normalized to SI before calculation; result inputs retain original and SI values. NaN, infinity, booleans, unsupported unit spellings, wrong dimensions and nonpositive values where prohibited fail closed.
 
@@ -42,6 +42,14 @@ Input ranges must include their nominal values. If a current limit or power rati
 `clock_divider_candidate` and `POST /api/projects/<id>/calculations/clock-divider` accept explicit source frequency, target tick rate, and source tolerance. They calculate `N = max(1, nearest_integer(f_source / f_target))`, then report the nominal output rate, quantization error, and source-tolerance drift bounds. The rounding is nearest integer with half-up behavior. This is useful for exploring a divider ratio from supplied values; it does not derive component choices or check a physical counter/MCU implementation. The modulus is restricted to the JavaScript-safe integer range to keep saved reports interoperable.
 
 If the requested output exceeds the source frequency, integer division cannot up-convert it; modulus one is returned as the nearest candidate with a warning. A candidate is never called a pass or a hardware design.
+
+## Linear DC MNA operating point
+
+`solve_dc_operating_point` and `POST /api/projects/<id>/simulations/dc-operating-point` solve an explicitly supplied, bounded linear network containing only ideal resistors, independent DC voltage sources, and independent DC current sources. The implementation assembles the modified nodal conductance matrix, solves it by row-scaled Gaussian elimination with partial pivoting, rejects singular/weak-pivot systems, and reports node voltages, element voltage/current/power, KCL and source-constraint residuals, normalized residual, and power balance.
+
+The JSON netlist has an explicit ground label and two-terminal elements with typed quantities. Current-source direction follows the listed terminal order; voltage-source voltage is terminal zero minus terminal one. The implementation is bounded to 500 elements, 150 non-ground nodes and 180 MNA unknowns. It rejects unsupported and malformed entries rather than guessing device models.
+
+This is a real numerical **linear DC operating-point solve**, not a transient simulation, nonlinear SPICE run, or result from ngspice. Capacitors/inductors, dependent sources, semiconductor models, tolerances, temperature, parasitics, and transient behavior are unsupported. The user-supplied netlist is hash-recorded but is not generated from or compared with the saved circuit graph. A model edit is shown separately from netlist integrity; it does not claim that the netlist changed or rerun it.
 
 ## Clock timebase error budget
 

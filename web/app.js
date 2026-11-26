@@ -49,18 +49,20 @@ function renderResult(project) {
   const artifactButtons = (project.artifacts || []).map((name) => name.endsWith('.raw') || name.endsWith('.pdf')
     ? `<a class="artifact-button" href="/api/projects/${encodeURIComponent(project.project_id)}/artifact/${encodeURIComponent(name)}" download>↓ &nbsp;Download ${escapeHtml(name)}</a>`
     : `<button class="artifact-button" data-artifact="${escapeHtml(name)}">↗ &nbsp;${escapeHtml(name)}</button>`).join('');
-  $('#view-result').innerHTML = `<div class="result-top"><div class="eyebrow"><span class="eyebrow-line"></span> ENGINEERING INTAKE COMPLETE</div><h1>${escapeHtml(project.name)}</h1><p>${escapeHtml(project.architecture)} architecture · Created ${escapeHtml(new Date(project.created_at).toLocaleString())}</p><div class="result-actions"><a class="primary-button" href="/api/projects/${encodeURIComponent(project.project_id)}/export"><span>Download project ZIP</span><span class="button-arrow">↓</span></a><button class="small-button" id="edit-circuit">Edit circuit model</button><button class="small-button" id="run-led-resistor-calculation">Analyze LED resistor</button><button class="small-button" id="run-clock-timebase-calculation">Analyze clock timebase</button><button class="small-button" id="run-clock-divider-calculation">Find divider candidate</button><button class="small-button" id="import-schematic">Import KiCad schematic</button><button class="small-button" id="run-kicad-erc">Run KiCad ERC</button><button class="small-button" id="import-board">Import KiCad PCB</button><button class="small-button" id="run-kicad-drc">Run KiCad DRC</button><button class="small-button" id="import-datasheet">Import datasheet PDF</button><button class="small-button" id="extract-datasheet-text">Extract latest PDF text</button><button class="small-button" id="import-spice">Import SPICE deck</button><button class="small-button" id="run-ngspice">Run ngspice</button><button class="small-button" id="show-snapshots">Snapshots</button><button class="small-button" id="back-to-brief">← New analysis</button></div></div>
+  $('#view-result').innerHTML = `<div class="result-top"><div class="eyebrow"><span class="eyebrow-line"></span> ENGINEERING INTAKE COMPLETE</div><h1>${escapeHtml(project.name)}</h1><p>${escapeHtml(project.architecture)} architecture · Created ${escapeHtml(new Date(project.created_at).toLocaleString())}</p><div class="result-actions"><a class="primary-button" href="/api/projects/${encodeURIComponent(project.project_id)}/export"><span>Download project ZIP</span><span class="button-arrow">↓</span></a><button class="small-button" id="edit-circuit">Edit circuit model</button><button class="small-button" id="run-led-resistor-calculation">Analyze LED resistor</button><button class="small-button" id="run-clock-timebase-calculation">Analyze clock timebase</button><button class="small-button" id="run-clock-divider-calculation">Find divider candidate</button><button class="small-button" id="run-dc-mna">Solve linear DC MNA</button><button class="small-button" id="import-schematic">Import KiCad schematic</button><button class="small-button" id="run-kicad-erc">Run KiCad ERC</button><button class="small-button" id="import-board">Import KiCad PCB</button><button class="small-button" id="run-kicad-drc">Run KiCad DRC</button><button class="small-button" id="import-datasheet">Import datasheet PDF</button><button class="small-button" id="extract-datasheet-text">Extract latest PDF text</button><button class="small-button" id="import-spice">Import SPICE deck</button><button class="small-button" id="run-ngspice">Run ngspice</button><button class="small-button" id="show-snapshots">Snapshots</button><button class="small-button" id="back-to-brief">← New analysis</button></div></div>
   <div class="status-banner">⚠ &nbsp; Incomplete — this is requirements and feasibility analysis, not a completed electrical design.</div>
   <div class="result-grid"><div><section class="result-panel"><h2>Feasibility findings <span class="optional">${findings.length} ITEMS</span></h2>${findings.map((finding) => `<div class="finding"><span class="finding-icon">!</span><span>${escapeHtml(finding)}</span></div>`).join('')}</section>
   <section class="result-panel"><h2>Supplied component inventory</h2>${inventoryRows ? `<table class="inventory-table"><thead><tr><th>PART / DESCRIPTION</th><th>QTY</th><th>VERIFICATION</th></tr></thead><tbody>${inventoryRows}</tbody></table>` : '<div class="empty-state">No inventory provided.</div>'}</section></div>
-  <div><section class="result-panel"><h2>Validation ledger</h2>${statusLines}</section><section class="result-panel"><h2>Engineering calculations</h2><p class="calc-explanation">“Current” means the report’s circuit-model hash matches this revision; it is not design approval.</p><div id="calculation-status"><div class="empty-state">Checking calculation revision status…</div></div></section><section class="result-panel"><h2>Generated artifacts <span class="optional">${(project.artifacts||[]).length}</span></h2><div class="artifact-list">${artifactButtons}</div></section></div></div>`;
+  <div><section class="result-panel"><h2>Validation ledger</h2>${statusLines}</section><section class="result-panel"><h2>Engineering calculations</h2><p class="calc-explanation">“Current” means the report’s circuit-model hash matches this revision; it is not design approval.</p><div id="calculation-status"><div class="empty-state">Checking calculation revision status…</div></div></section><section class="result-panel"><h2>Linear DC MNA operating points</h2><p class="calc-explanation">Solves an explicit ideal R/V/I netlist. It is not derived from the saved graph or a SPICE/transient run.</p><div id="simulation-status"><div class="empty-state">Checking saved operating-point reports…</div></div></section><section class="result-panel"><h2>Generated artifacts <span class="optional">${(project.artifacts||[]).length}</span></h2><div class="artifact-list">${artifactButtons}</div></section></div></div>`;
   $('#view-result').querySelectorAll('[data-artifact]').forEach((button) => button.addEventListener('click', () => openArtifact(project.project_id, button.dataset.artifact)));
   $('#back-to-brief').addEventListener('click', () => showView('new'));
   $('#edit-circuit').addEventListener('click', openCircuitEditor);
   $('#run-led-resistor-calculation').addEventListener('click', openLedResistorCalculation);
   $('#run-clock-timebase-calculation').addEventListener('click', openClockTimebaseCalculation);
   $('#run-clock-divider-calculation').addEventListener('click', openClockDividerCalculation);
+  $('#run-dc-mna').addEventListener('click', openMnaDialog);
   loadCalculationStatus(project.project_id);
+  loadSimulationStatus(project.project_id);
   $('#import-schematic').addEventListener('click', () => $('#schematic-file').click());
   $('#run-kicad-erc').addEventListener('click', runKiCadErc);
   $('#import-board').addEventListener('click', () => $('#board-file').click());
@@ -109,6 +111,48 @@ function rangeInput(minId, maxId, unit, label) {
   if (minimum === null && maximum === null) return null;
   if (minimum === null || maximum === null) throw new Error(`Enter both ${label} minimum and maximum, or leave both blank`);
   return {min:{value:minimum, unit}, max:{value:maximum, unit}};
+}
+async function loadSimulationStatus(projectId) {
+  const node = $('#simulation-status');
+  if (!node) return;
+  try {
+    const data = await (await request(`/api/projects/${encodeURIComponent(projectId)}/simulations`)).json();
+    if (!data.simulations?.length) { node.innerHTML = '<div class="empty-state">No linear DC MNA runs have been saved.</div>'; return; }
+    node.innerHTML = [...data.simulations].reverse().map((run) => `<div class="validation-line"><span>${escapeHtml(run.kind.replaceAll('_',' '))}</span><span class="calc-state ${run.model_status === 'same-at-run' && run.netlist_status === 'intact' ? 'current' : 'stale'}">${escapeHtml(run.model_status)} · netlist ${escapeHtml(run.netlist_status)} · ${escapeHtml(new Date(run.created_at).toLocaleString())}</span></div>`).join('');
+  } catch (error) { node.textContent = `Simulation history unavailable: ${error.message}`; }
+}
+function openMnaDialog() {
+  $('#mna-feedback').textContent = 'Enter a complete independent-source/resistor netlist. No topology is imported from the saved graph; save a model-aligned netlist only after checking it yourself.';
+  $('#mna-feedback').className = 'dialog-feedback';
+  $('#mna-dialog').showModal();
+}
+async function runMna(event) {
+  event.preventDefault();
+  const feedback = $('#mna-feedback');
+  try {
+    const netlist = JSON.parse($('#mna-netlist').value);
+    const response = await fetch(`/api/projects/${encodeURIComponent(currentProject.project_id)}/simulations/dc-operating-point`, {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({netlist})
+    });
+    const report = await response.json();
+    if (!response.ok) throw new Error(report.error || `MNA solve failed (${response.status})`);
+    const out = report.calculation.outputs;
+    const nodeRows = Object.entries(out.node_voltages).map(([node, voltage]) => `${node}: ${Number(voltage.value).toPrecision(7)} V`).join('\n');
+    const elementRows = out.elements.map((element) => `${element.reference} (${element.type}): V=${Number(element.voltage.value).toPrecision(6)} V, I=${Number(element.current.value).toPrecision(6)} A, P_abs=${Number(element.power_absorbed.value).toPrecision(6)} W`).join('\n');
+    feedback.textContent = `Solver state: ${out.solver_status}\nNode voltages:\n${nodeRows}\nElement results (positive power is absorbed):\n${elementRows}\nPower balance: ${Number(out.total_power_balance.value).toExponential(4)} W · normalized equation residual: ${Number(out.normalized_equation_residual).toExponential(3)}\n${report.calculation.warnings.join(' ')}\nSaved as ${report.artifact}; netlist SHA-256 ${report.netlist_sha256.slice(0,16)}…`;
+    feedback.className = 'dialog-feedback ok';
+    const projectId = currentProject.project_id;
+    await loadProjects();
+    currentProject = projectCache.find((project) => project.project_id === projectId) || currentProject;
+    await loadSimulationStatus(projectId);
+    const artifactList = $('#view-result .artifact-list');
+    if (artifactList && !artifactList.querySelector(`[data-artifact="${report.artifact}"]`)) {
+      const button = document.createElement('button'); button.className = 'artifact-button'; button.textContent = `↗  ${report.artifact}`;
+      button.addEventListener('click', () => openArtifact(projectId, report.artifact)); artifactList.append(button);
+    }
+  } catch (error) {
+    feedback.textContent = error.message; feedback.className = 'dialog-feedback error';
+  }
 }
 function openClockDividerCalculation() {
   $('#clock-divider-feedback').textContent = 'Enter the supplied source and desired output rates plus a sourced tolerance. The integer result is a math candidate; device limits and logic behavior are not checked.';
@@ -471,6 +515,7 @@ $('#spice-file').addEventListener('change', (event) => {
 $('#led-calc-form').addEventListener('submit', calculateLedResistor);
 $('#clock-timebase-form').addEventListener('submit', calculateClockTimebase);
 $('#clock-divider-form').addEventListener('submit', calculateClockDivider);
+$('#mna-form').addEventListener('submit', runMna);
 $('#circuit-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   try {

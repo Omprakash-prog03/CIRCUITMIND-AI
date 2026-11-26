@@ -191,6 +191,37 @@ class CircuitApiTests(unittest.TestCase):
         self.assertIn("none was inferred", audit["components"][0]["reason"])
         self.assertEqual(audit["unresolved_count"], 1)
 
+    def test_linear_dc_mna_report_preserves_netlist_hash_and_model_association(self):
+        _, created = self.call("/api/projects", {"name": "MNA DC check", "description": "Explicit linear DC model", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        model = self.sample_design()
+        self.assertEqual(self.call(f"/api/projects/{project_id}/circuit", {"model": model}, "PUT")[0], 200)
+        netlist = {"ground": "0", "elements": [
+            {"type": "voltage_source", "reference": "V1", "nodes": ["VIN", "0"], "voltage": {"value": 5, "unit": "V"}},
+            {"type": "resistor", "reference": "R1", "nodes": ["VIN", "MID"], "resistance": {"value": 1, "unit": "kohm"}},
+            {"type": "resistor", "reference": "R2", "nodes": ["MID", "0"], "resistance": {"value": 1, "unit": "kohm"}},
+        ]}
+        code, report = self.call(f"/api/projects/{project_id}/simulations/dc-operating-point", {"netlist": netlist}, "POST")
+        self.assertEqual(code, 201)
+        self.assertEqual(report["kind"], "linear_dc_mna_operating_point")
+        self.assertAlmostEqual(report["calculation"]["outputs"]["node_voltages"]["MID"]["value"], 2.5)
+        self.assertIn("not generated from", report["model_association"])
+        code, history = self.call(f"/api/projects/{project_id}/simulations")
+        self.assertEqual(code, 200)
+        self.assertEqual(history["simulations"][-1]["model_status"], "same-at-run")
+        self.assertEqual(history["simulations"][-1]["netlist_status"], "intact")
+        changed_model = dict(model)
+        changed_model["limitations"] = list(model["limitations"]) + ["Changed separately from explicit MNA input"]
+        self.assertEqual(self.call(f"/api/projects/{project_id}/circuit", {"model": changed_model}, "PUT")[0], 200)
+        code, history = self.call(f"/api/projects/{project_id}/simulations")
+        self.assertEqual(code, 200)
+        self.assertEqual(history["simulations"][-1]["model_status"], "model-changed-since-run")
+        self.assertEqual(history["simulations"][-1]["netlist_status"], "intact")
+        singular = {"ground": "0", "elements": [{"type": "current_source", "reference": "I1", "nodes": ["N1", "0"], "current": {"value": 1, "unit": "mA"}}]}
+        code, error = self.call(f"/api/projects/{project_id}/simulations/dc-operating-point", {"netlist": singular}, "POST")
+        self.assertEqual(code, 422)
+        self.assertIn("singular", error["error"])
+
     def test_clock_divider_candidate_is_saved_as_math_not_implementation_approval(self):
         _, created = self.call("/api/projects", {"name": "Divider candidate", "description": "Clock rate planning", "inventory": "", "architecture": "discrete"}, "POST")
         project_id = created["project_id"]

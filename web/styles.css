@@ -4,3 +4,4 @@
 .calc-state{font:9px var(--mono);text-align:right}.calc-state.current{color:var(--green)!important}.calc-state.stale{color:var(--red)!important}
 .calc-explanation{margin:-5px 0 9px;color:#89948b;font-size:10px;line-height:1.5}
 #led-calc-dialog{width:min(920px,92vw)}#led-calc-dialog .dialog-feedback{white-space:pre-line;max-height:24vh;overflow:auto;line-height:1.65}
+#mna-dialog{width:min(980px,94vw)}#mna-netlist{width:100%;min-height:240px;max-height:48vh;resize:vertical;background:#0d110f;border:1px solid #303a33;border-radius:5px;color:#c8d2c9;padding:13px;font:11px/1.55 var(--mono);tab-size:2;outline:none}#mna-netlist:focus{border-color:#789e5d}.mna-label{display:block;color:#c4cbc5;font-size:10px;margin:10px 0 6px}#mna-dialog .dialog-feedback{white-space:pre-line;max-height:25vh;overflow:auto;line-height:1.65}
