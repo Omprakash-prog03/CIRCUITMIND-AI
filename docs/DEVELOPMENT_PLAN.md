@@ -1,0 +1,51 @@
+# CIRCUITMIND AI — development plan
+
+The repository began as a README-only shell. Implement in vertical slices; each milestone must keep engineering status explicit and add regression tests.
+
+## Milestone 1 — Project intake and feasibility (implemented in this branch)
+
+- Local desktop-style browser workbench with project-description and BOM intake.
+- Deterministic inventory parser, benchmark-specific discrete-clock feasibility analysis, architecture selection, and calculation primitives.
+- Persist a project model and traceable report artifacts; list/reopen projects and export a ZIP.
+- Add a typed circuit-model boundary and connectivity validation; report limitations accurately.
+- Acceptance: no-dependency server starts; user can create project end to end; missing components are surfaced; outputs do not claim unrun checks.
+
+## Milestone 2 — Circuit model and schematic interoperability
+
+- Promote editable circuit model to versioned component/pin/net schema, graph validation, snapshots and migration tests.
+- Add KiCad adapter with real symbol-library resolution and export; open generated output in KiCad CLI when installed.
+- Require pinout provenance and electrical rule-check evidence; keep unknown pins unresolved.
+
+## Milestone 3 — Engineering integrations
+
+- Isolated, version-reporting adapters for KiCad ERC/DRC, ngspice, PlatformIO, Arduino CLI, and native compilers.
+- Run tools in a sandbox with timeouts, resource limits, allow-listed commands, captured logs, and deterministic test fixtures.
+- Never equate integration availability with successful validation; preserve raw output and exit status.
+
+## Milestone 4 — Datasheets, component library, calculations
+
+- Datasheet import and source-linked extraction; verified part/variant and package identity.
+- Expand tested calculation library (tolerances, operating corners, unit-aware values) and component compatibility checks.
+- Explicit uncertainty, assumptions, and provenance on every inferred value.
+
+## Milestone 5 — Firmware and hardware/software consistency
+
+- Reproducible project scaffolding for supported MCU targets; typed GPIO assignment map shared with circuit model.
+- Compile and test generated firmware using detected real toolchains; validate cross-layer pin/interface consistency.
+- Firmware generation must be absent for all-discrete designs.
+
+## Milestone 6 — Agent loop and model providers
+
+- Provider-neutral structured tool-call interface, local Ollama/OpenAI-compatible adapters, capability detection, and permission controls.
+- Bounded observe/plan/execute/check loop, action log, immutable snapshots, approval gates for destructive operations, and credential vault.
+- Agent can call only implemented tools; all tool outputs are authoritative evidence.
+
+## Milestone 7 — Editor, wiring, and delivery
+
+- Interactive schematic and breadboard views driven from the same validated connectivity graph; undo/redo and autosave.
+- BOM, wiring instructions, simulation/test/validation reports, PCB/manufacturing exports, project backup/restore.
+- Desktop packaging, signing/update pipeline, CI matrix, security review, crash reporting and production deployment.
+
+## Release gate
+
+The digital clock benchmark must pass separate discrete and ESP32-hybrid acceptance suites. A result must state AI-generated, electrically checked, compiled, simulated, hardware tested, and manufacturing checked independently. No status is promoted without evidence from the relevant tool.
