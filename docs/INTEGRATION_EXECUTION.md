@@ -14,6 +14,13 @@
 3. Outcomes include `unavailable`, `not-run`, `timeout`, `failed`, `failed-to-start`, `completed-unparsed`, `completed-with-violations`, and `completed-no-reported-violations`. A zero exit is not clean by itself: the report must include explicit counts for both DRC violations and unconnected pads, and both must be zero for the no-reported-violations status.
 4. This status reflects only KiCad's report for the imported board. It does not establish electrical design correctness, successful fabrication, manufacturing-rule suitability, assembly quality, or hardware operation. Review the report and confirm board-specific constraints separately.
 
+## Installed KiCad symbol audit (read-only)
+
+1. In the circuit editor, choose **Audit installed symbols**. The UI sends the current draft to `POST /api/projects/<id>/circuit/symbols/resolve` as JSON `{ "model": ... }`; the stored model is not replaced or saved by this operation.
+2. The resolver searches a project-local `sym-lib-table`, an optional `KICAD_SYMBOL_LIB_TABLE`, user KiCad configuration tables, then common system tables. URI variables such as `${KICAD9_SYMBOL_DIR}` are expanded from the environment; `KICAD_SYMBOL_DIR` may be set as a fallback for deployments where KiCad has not exported its versioned variable. Only local `.kicad_sym` files are read, with 4 MB table and 32 MB symbol-library limits.
+3. The report includes exact symbol properties, extracted declared pin number/name/electrical-type data, each library file SHA-256, the submitted model SHA-256, and per-component differences against the model's current declared pins. The JSON audit is retained as `kicad_symbol_audit_<run-id>.json`.
+4. No symbol ID or pinout is inferred or written back. Missing libraries remain unavailable; inherited definitions are explicitly marked unexpanded and are not treated as complete. This lookup is not a datasheet cross-check, electrical check, ERC, or proof that the symbol/footprint is suitable for a particular part.
+
 ## ngspice batch simulation (implemented adapter)
 
 1. Attach a `.cir`, `.sp`, or `.ckt` netlist through `PUT /api/projects/<id>/simulation-deck` with JSON `{ "content": "..." }`. The source is size-limited, checked against a conservative directive allowlist before storage, and its replacement requires confirmation with the previous deck archived.
@@ -23,7 +30,7 @@
 
 ## Trust and resource limits
 
-Both adapters use fixed commands without shell, wall-clock timeouts, bounded captured logs, a restricted child environment, and project-local temporary directories. **Neither is a secure sandbox**: binaries are not isolated from the user's OS, filesystem, or network; the SPICE checker is only a static allowlist. Only run trusted local tool binaries and trusted input files. Process memory/CPU/filesystem quotas and OS/container isolation are future work.
+Native tool adapters use fixed commands without a shell, wall-clock timeouts, bounded captured logs, a restricted child environment, and project-local temporary directories. They are **not secure sandboxes**: binaries are not isolated from the user's OS, filesystem, or network; the SPICE checker is only a static allowlist. The installed-symbol audit parses local library files in-process and is likewise not a security boundary for hostile files. Only run trusted local tool binaries and trusted input files. Process memory/CPU/filesystem quotas and OS/container isolation are future work.
 
 ## Other tool status
 

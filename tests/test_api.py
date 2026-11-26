@@ -137,6 +137,48 @@ class CircuitApiTests(unittest.TestCase):
         code, bad = self.call(f"/api/projects/{project_id}/board", {"content": "not a board"}, "PUT")
         self.assertEqual(code, 422)
 
+    def test_installed_symbol_audit_is_read_only_and_preserves_mismatch_evidence(self):
+        _, created = self.call("/api/projects", {"name": "Symbol audit", "description": "Resolve only verified library IDs", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        symbols = Path(self.temp.name) / "symbols"
+        symbols.mkdir()
+        (symbols / "Device.kicad_sym").write_text('''(kicad_symbol_lib (version 20231120)
+          (symbol "R" (property "Reference" "R")
+            (symbol "R_1_1"
+              (pin passive line (name "A") (number "1"))
+              (pin passive line (name "B") (number "2")))))''', "utf-8")
+        table = Path(self.temp.name) / "sym-lib-table"
+        table.write_text(f'''(sym_lib_table (version 7)
+          (lib (name "Device") (type "KiCad") (uri "${{KICAD_SYMBOL_DIR}}/Device.kicad_sym")))''', "utf-8")
+        model = self.sample_design()
+        with patch.dict(os.environ, {"KICAD_SYMBOL_LIB_TABLE": str(table), "KICAD_SYMBOL_DIR": str(symbols)}):
+            code, audit = self.call(f"/api/projects/{project_id}/circuit/symbols/resolve", {"model": model}, "POST")
+        self.assertEqual(code, 200)
+        self.assertEqual(audit["mismatch_count"], 2)
+        self.assertEqual(audit["resolved_count"], 2)
+        self.assertTrue(all(item["status"] == "pin-manifest-differs" for item in audit["components"]))
+        self.assertEqual(len(audit["model_sha256"]), 64)
+        self.assertEqual(audit["artifact"].split(".")[-1], "json")
+        code, stored = self.call(f"/api/projects/{project_id}/circuit")
+        self.assertEqual(code, 200)
+        self.assertEqual(stored["model"]["components"], [])
+        code, artifact = self.call(f"/api/projects/{project_id}/artifact/{audit['artifact']}")
+        self.assertEqual(code, 200)
+        self.assertIn("No model changes", artifact["content"])
+
+    def test_symbol_audit_does_not_guess_missing_library_ids(self):
+        _, created = self.call("/api/projects", {"name": "Unresolved symbol", "description": "No implicit part selection", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        model = self.sample_design()
+        model["components"] = model["components"][:1]
+        model["nets"] = []
+        model["components"][0]["symbol"] = None
+        code, audit = self.call(f"/api/projects/{project_id}/circuit/symbols/resolve", {"model": model}, "POST")
+        self.assertEqual(code, 200)
+        self.assertEqual(audit["components"][0]["status"], "no-symbol-id")
+        self.assertIn("none was inferred", audit["components"][0]["reason"])
+        self.assertEqual(audit["unresolved_count"], 1)
+
     def test_spice_deck_import_requires_static_allowlist_and_simulation_is_logged(self):
         _, created = self.call("/api/projects", {"name": "SPICE API", "description": "RC transient test", "inventory": "", "architecture": "discrete"}, "POST")
         project_id = created["project_id"]

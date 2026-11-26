@@ -15,6 +15,7 @@ from urllib.parse import unquote, urlparse
 from . import __version__
 from .circuit_schema import export_kicad_netlist, migrate_model, validate_model
 from .integrations import discover_integrations, run_kicad_drc, run_kicad_erc, run_ngspice
+from .kicad_symbols import resolve_kicad_symbol
 from .spice import validate_spice_deck
 from .models import ProjectInput
 from .project_store import list_snapshots, load_circuit, restore_snapshot, save_circuit
@@ -222,6 +223,77 @@ class Handler(BaseHTTPRequestHandler):
                 _atomic_bytes(validation_path, (json.dumps(validation, indent=2, ensure_ascii=False) + "\n").encode())
                 _update_project_record(folder, validation)
             return self._json(200, result)
+        if len(parts) == 6 and parts[:2] == ["api", "projects"] and parts[3:] == ["circuit", "symbols", "resolve"]:
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            try:
+                payload = self._read_payload()
+                model = migrate_model(payload.get("model"))
+                topology = validate_model(model)
+                if not topology["topology_valid"]:
+                    return self._json(422, {"error": "Circuit model failed schema/topology checks", "topology_report": topology})
+                components = model.get("components", [])
+                if len(components) > 200:
+                    return self._json(413, {"error": "Symbol audit is limited to 200 components per request"})
+                by_symbol: dict[tuple[str, str], dict[str, object]] = {}
+                results = []
+                for component in components:
+                    reference = component["reference"]
+                    symbol = component.get("symbol")
+                    if not isinstance(symbol, dict):
+                        results.append({"reference": reference, "status": "no-symbol-id", "reason": "No explicit KiCad library and symbol ID is assigned; none was inferred."})
+                        continue
+                    key = (symbol["library"], symbol["name"])
+                    if key not in by_symbol:
+                        by_symbol[key] = resolve_kicad_symbol(*key, project_dir=folder)
+                    resolved = by_symbol[key]
+                    item = {"reference": reference, **resolved}
+                    if resolved.get("status") == "resolved":
+                        actual_pins = resolved.get("pins", [])
+                        actual_by_number: dict[str, list[dict[str, object]]] = {}
+                        for pin in actual_pins:
+                            actual_by_number.setdefault(str(pin.get("number")), []).append(pin)
+                        declared = component.get("pins", [])
+                        missing = [pin.get("number") for pin in declared if str(pin.get("number")) not in actual_by_number]
+                        mismatched = []
+                        for pin in declared:
+                            candidates = actual_by_number.get(str(pin.get("number")), [])
+                            if candidates and not all(pin.get("name") == actual.get("name") and pin.get("type", "unspecified") == actual.get("type") for actual in candidates):
+                                mismatched.append({"number": pin.get("number"), "declared_name": pin.get("name"),
+                                                   "declared_type": pin.get("type", "unspecified"),
+                                                   "library_pins": [{"name": actual.get("name"), "type": actual.get("type")} for actual in candidates]})
+                        declared_numbers = {str(pin.get("number")) for pin in declared}
+                        additional = sorted(number for number in actual_by_number if number not in declared_numbers)
+                        item.update({"missing_declared_pins": missing, "declared_pin_mismatches": mismatched,
+                                     "library_pins_not_declared": additional,
+                                     "status": "pin-manifest-match" if not missing and not mismatched and not additional else "pin-manifest-differs"})
+                    results.append(item)
+                model_sha256 = hashlib.sha256(json.dumps(model, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+                report = {"status": "completed", "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                          "model_sha256": model_sha256,
+                          "scope": "Read-only installed-library lookup and declared-pin comparison. No model changes, electrical checks, ERC/DRC, or datasheet validation were performed.",
+                          "component_count": len(results),
+                          "resolved_count": sum(item["status"] in {"pin-manifest-match", "pin-manifest-differs"} for item in results),
+                          "mismatch_count": sum(item["status"] == "pin-manifest-differs" for item in results),
+                          "unresolved_count": sum(item["status"] not in {"pin-manifest-match", "pin-manifest-differs"} for item in results),
+                          "components": results}
+                report["run_id"] = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+                report_name = f"kicad_symbol_audit_{report['run_id']}.json"
+                report["artifact"] = report_name
+                with _CIRCUIT_API_LOCK:
+                    _atomic_bytes(folder / report_name, (json.dumps(report, indent=2, ensure_ascii=False) + "\n").encode())
+                    _update_project_record(folder)
+                return self._json(200, report)
+            except RequestTooLarge as exc:
+                return self._json(413, {"error": str(exc)})
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError, KeyError, TypeError) as exc:
+                return self._json(400, {"error": str(exc)})
+            except OSError as exc:
+                return self._json(500, {"error": f"Unable to audit KiCad symbols: {exc}"})
         if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["circuit", "validate"]:
             project_id = parts[2]
             if not _valid_id(project_id):

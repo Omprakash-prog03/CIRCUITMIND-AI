@@ -86,6 +86,33 @@ async function openCircuitEditor() {
     $('#circuit-dialog').showModal();
   } catch (error) { toast(error.message); }
 }
+async function auditCircuitSymbols() {
+  if (!currentProject) return;
+  try {
+    const model = JSON.parse($('#circuit-json').value);
+    const response = await fetch(`/api/projects/${encodeURIComponent(currentProject.project_id)}/circuit/symbols/resolve`, {
+      method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({model})
+    });
+    const report = await response.json();
+    if (!response.ok) { circuitFeedback(report.error || `Symbol audit failed (${response.status})`, 'error'); return; }
+    const mismatches = report.components.filter((item) => item.status === 'pin-manifest-differs').map((item) => item.reference);
+    const unresolved = report.components.filter((item) => !['pin-manifest-match', 'pin-manifest-differs'].includes(item.status)).map((item) => item.reference);
+    const detail = `Read-only symbol audit: ${report.resolved_count} IDs resolved, ${report.mismatch_count} declared pin manifest(s) differ, ${report.unresolved_count} unresolved. ${mismatches.length ? `Differences: ${mismatches.join(', ')}. ` : ''}${unresolved.length ? `Unresolved: ${unresolved.join(', ')}. ` : ''}Saved ${report.artifact}. No model changes or electrical validation.`;
+    circuitFeedback(detail, report.mismatch_count || report.unresolved_count ? 'error' : 'ok');
+    await loadProjects();
+    currentProject = projectCache.find((project) => project.project_id === currentProject.project_id) || currentProject;
+    const artifactList = $('#view-result .artifact-list');
+    if (artifactList && !artifactList.querySelector(`[data-artifact="${report.artifact}"]`)) {
+      const artifactButton = document.createElement('button');
+      artifactButton.className = 'artifact-button'; artifactButton.textContent = `↗  ${report.artifact}`;
+      artifactButton.addEventListener('click', () => openArtifact(currentProject.project_id, report.artifact));
+      artifactList.append(artifactButton);
+    }
+  } catch (error) {
+    circuitFeedback(`Symbol audit could not run: ${error.message}`, 'error');
+  }
+}
+
 async function validateCircuitDraft() {
   try {
     const model = JSON.parse($('#circuit-json').value);
@@ -239,6 +266,7 @@ $('#dialog-close').addEventListener('click', () => $('#artifact-dialog').close()
 $('#artifact-dialog').addEventListener('click', (event) => { if (event.target === $('#artifact-dialog')) $('#artifact-dialog').close(); });
 document.querySelectorAll('[data-close]').forEach((button) => button.addEventListener('click', () => $(`#${button.dataset.close}`).close()));
 $('#validate-circuit').addEventListener('click', validateCircuitDraft);
+$('#audit-circuit-symbols').addEventListener('click', auditCircuitSymbols);
 $('#schematic-file').addEventListener('change', (event) => {
   const file = event.target.files?.[0]; event.target.value = '';
   importSchematicFile(file);

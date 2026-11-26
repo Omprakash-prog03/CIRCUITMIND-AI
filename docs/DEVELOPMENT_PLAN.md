@@ -15,7 +15,7 @@ The repository began as a README-only shell. Implement in vertical slices; each 
 - Versioned schema v2 for model components, declared pins, placements, nets, and endpoints; v1 migration preserves only known fields and never infers symbols.
 - Browser JSON editor, non-mutating schema/topology validation, atomic saves, SHA-256 snapshots, restore, and archive inclusion.
 - KiCad legacy XML netlist generation gated on explicit symbol IDs and consistent graph/pin declarations; no static image is passed off as a schematic.
-- Symbol library resolution against actual installed libraries, pinout provenance, visual schematic editor, and KiCad CLI/ERC execution remain unimplemented. This environment has no `kicad-cli`; generated netlist bytes are not CLI-validated.
+- A read-only installed-symbol audit resolves explicit library IDs through KiCad symbol tables, extracts declared pin metadata with source hashes, and compares it with the draft without changing pins. Inherited symbols are marked incomplete rather than silently expanded. Full datasheet-linked pinout provenance, a visual schematic editor, and netlist validation by KiCad remain unimplemented; this environment has no `kicad-cli` or installed symbol tables.
 
 ## Milestone 3 — Engineering integrations (KiCad ERC/DRC + ngspice adapters implemented; others pending)
 
