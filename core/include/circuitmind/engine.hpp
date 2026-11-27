@@ -103,6 +103,42 @@ struct AcSweepResult {
     std::size_t unknown_count{};
 };
 
+enum class DigitalGateKind : std::uint32_t {
+    Not = 0, Buffer = 1, And = 2, Or = 3, Xor = 4, Nand = 5, Nor = 6, Xnor = 7, DFlipFlop = 8,
+};
+
+enum class DigitalClockEdge : std::uint8_t { Rising = 0, Falling = 1 };
+
+struct DigitalGate {
+    DigitalGateKind kind{};
+    std::size_t input_a{};
+    std::size_t input_b{}; // Unused for NOT and buffer gates; clock net for a D flip-flop.
+    std::size_t output{};
+    std::uint8_t initial_value{}; // Initial Q state for DFlipFlop; ignored for combinational gates.
+    DigitalClockEdge active_edge{DigitalClockEdge::Rising}; // DFlipFlop capture edge; ignored for combinational gates.
+};
+
+struct DigitalCircuit {
+    std::size_t net_count{};
+    std::vector<std::size_t> input_nets;
+    std::vector<std::size_t> output_nets;
+    std::vector<DigitalGate> gates;
+};
+
+struct DigitalTruthTableResult {
+    // Row-major: input combination * output_count + output column.
+    std::vector<std::uint8_t> output_values;
+    std::size_t row_count{};
+    std::size_t output_count{};
+};
+
+struct DigitalWaveformResult {
+    std::vector<double> sample_times_s;
+    // Row-major: sample * output_count + output column.
+    std::vector<std::uint8_t> output_values;
+    std::size_t output_count{};
+};
+
 class SolverError : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
@@ -114,5 +150,9 @@ public:
                                             const std::vector<double>& source_values);
 [[nodiscard]] TransientResult simulateTransientRc(const Circuit& circuit, const TransientOptions& options);
 [[nodiscard]] AcSweepResult simulateAcSweep(const AcCircuit& circuit, const std::vector<double>& frequencies_hz);
+[[nodiscard]] DigitalTruthTableResult simulateDigitalTruthTable(const DigitalCircuit& circuit);
+[[nodiscard]] DigitalWaveformResult simulateDigitalWaveform(
+    const DigitalCircuit& circuit, const std::vector<std::uint8_t>& primary_input_samples,
+    std::size_t sample_count, double sample_interval_s);
 
 } // namespace circuitmind

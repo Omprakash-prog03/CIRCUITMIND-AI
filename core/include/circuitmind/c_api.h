@@ -117,6 +117,63 @@ typedef struct cm_ac_sweep_result_v1 {
     size_t unknown_count;
 } cm_ac_sweep_result_v1;
 
+typedef struct cm_digital_gate_v1 {
+    uint32_t kind; /* 0 NOT, 1 buffer, 2 AND, 3 OR, 4 XOR, 5 NAND, 6 NOR, 7 XNOR */
+    uint32_t input_a;
+    uint32_t input_b; /* ignored for NOT and buffer */
+    uint32_t output;
+} cm_digital_gate_v1;
+
+typedef struct cm_digital_waveform_gate_v1 {
+    uint32_t kind; /* 0 NOT, 1 buffer, 2 AND, 3 OR, 4 XOR, 5 NAND, 6 NOR, 7 XNOR, 8 D flip-flop */
+    uint32_t input_a; /* D input for DFF */
+    uint32_t input_b; /* ignored for NOT and buffer; clock input for DFF */
+    uint32_t output;
+    uint8_t initial_value; /* DFF initial Q state; ignored for combinational gates */
+    uint8_t active_edge; /* DFF: 0 rising (default), 1 falling; ignored for combinational gates */
+} cm_digital_waveform_gate_v1;
+
+typedef struct cm_digital_truth_table_request_v1 {
+    uint32_t request_version; /* must be 1 */
+    uint32_t net_count;
+    uint32_t gate_count;
+    const cm_digital_gate_v1* gates;
+    uint32_t input_count;
+    const uint32_t* input_nets;
+    uint32_t output_count;
+    const uint32_t* output_nets;
+} cm_digital_truth_table_request_v1;
+
+typedef struct cm_digital_truth_table_result_v1 {
+    uint8_t* output_values; /* row-major 0/1 bytes */
+    size_t output_capacity;
+    size_t row_count;
+    size_t output_count;
+} cm_digital_truth_table_result_v1;
+
+typedef struct cm_digital_waveform_request_v1 {
+    uint32_t request_version; /* must be 1 */
+    uint32_t net_count;
+    uint32_t gate_count;
+    const cm_digital_waveform_gate_v1* gates;
+    uint32_t input_count;
+    const uint32_t* input_nets;
+    uint32_t output_count;
+    const uint32_t* output_nets;
+    size_t sample_count;
+    const uint8_t* primary_input_samples; /* row-major sample * input_count; values must be 0 or 1 */
+    double sample_interval_s;
+} cm_digital_waveform_request_v1;
+
+typedef struct cm_digital_waveform_result_v1 {
+    double* sample_times_s;
+    size_t sample_time_capacity;
+    uint8_t* output_values; /* row-major sample * output_count */
+    size_t output_capacity;
+    size_t sample_count;
+    size_t output_count;
+} cm_digital_waveform_result_v1;
+
 CM_API const char* cm_engine_version(void);
 CM_API uint32_t cm_engine_abi_version(void);
 CM_API int cm_engine_solve_dc_v1(const cm_dc_request_v1* request,
@@ -138,6 +195,14 @@ CM_API int cm_engine_simulate_transient_rc_v1(const cm_transient_request_v1* req
 CM_API int cm_engine_simulate_ac_sweep_v1(const cm_ac_sweep_request_v1* request,
                                           cm_ac_sweep_result_v1* result,
                                           char* error_message, size_t error_capacity);
+CM_API int cm_engine_simulate_digital_truth_table_v1(
+    const cm_digital_truth_table_request_v1* request,
+    cm_digital_truth_table_result_v1* result,
+    char* error_message, size_t error_capacity);
+CM_API int cm_engine_simulate_digital_waveform_v1(
+    const cm_digital_waveform_request_v1* request,
+    cm_digital_waveform_result_v1* result,
+    char* error_message, size_t error_capacity);
 
 #ifdef __cplusplus
 }
