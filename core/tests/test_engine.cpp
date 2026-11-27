@@ -229,6 +229,127 @@ void testBackwardEulerRlStep() {
     assert(result.maximum_equation_residual < 1e-10);
 }
 
+void testDigitalTruthTableAndCAbi() {
+    using circuitmind::DigitalCircuit;
+    using circuitmind::DigitalGate;
+    using circuitmind::DigitalGateKind;
+    DigitalCircuit circuit{5, {0, 1}, {2, 4}, {
+        {DigitalGateKind::And, 3, 0, 4}, // Deliberately listed before its NAND dependency.
+        {DigitalGateKind::Nand, 0, 1, 3},
+        {DigitalGateKind::Xor, 0, 1, 2},
+    }};
+    const auto solved = circuitmind::simulateDigitalTruthTable(circuit);
+    const std::uint8_t expected[] = {0, 0, 1, 0, 1, 1, 0, 0};
+    assert(solved.row_count == 4 && solved.output_count == 2);
+    for (std::size_t index = 0; index < solved.output_values.size(); ++index) {
+        assert(solved.output_values[index] == expected[index]);
+    }
+
+    const cm_digital_gate_v1 gates[] = {
+        {2, 3, 0, 4}, {5, 0, 1, 3}, {4, 0, 1, 2},
+    };
+    const std::uint32_t inputs[] = {0, 1};
+    const std::uint32_t outputs[] = {2, 4};
+    const cm_digital_truth_table_request_v1 request{1, 5, 3, gates, 2, inputs, 2, outputs};
+    std::uint8_t output_values[8]{};
+    cm_digital_truth_table_result_v1 output{output_values, 8, 0, 0};
+    char error[256]{};
+    const int status = cm_engine_simulate_digital_truth_table_v1(&request, &output, error, sizeof(error));
+    assert(status == 0);
+    assert(output.row_count == 4 && output.output_count == 2);
+    for (std::size_t index = 0; index < 8; ++index) assert(output_values[index] == expected[index]);
+    output.output_capacity = 1;
+    const int short_buffer_status = cm_engine_simulate_digital_truth_table_v1(&request, &output, error, sizeof(error));
+    assert(short_buffer_status != 0);
+    assert(std::string_view(error).find("too small") != std::string_view::npos);
+
+    bool cycle_rejected = false;
+    try {
+        DigitalCircuit cyclic{3, {0}, {1}, {
+            {DigitalGateKind::Buffer, 2, 0, 1},
+            {DigitalGateKind::Not, 1, 0, 2},
+        }};
+        (void)circuitmind::simulateDigitalTruthTable(cyclic);
+    } catch (const circuitmind::SolverError&) { cycle_rejected = true; }
+    assert(cycle_rejected);
+}
+
+void testDigitalSampledWaveformAndCAbi() {
+    using circuitmind::DigitalCircuit;
+    using circuitmind::DigitalGate;
+    using circuitmind::DigitalGateKind;
+    // The DFF breaks the combinational dependency graph; Q-bar is recomputed after each edge.
+    DigitalCircuit circuit{4, {0, 1}, {2, 3}, {
+        {DigitalGateKind::DFlipFlop, 0, 1, 2, 0},
+        {DigitalGateKind::Not, 2, 0, 3, 0},
+    }};
+    const std::vector<std::uint8_t> samples{
+        0, 0, // initial Q=0
+        1, 0, // D changes, no edge
+        1, 1, // rising edge captures 1
+        0, 1, // no new edge, Q holds
+        0, 0, // falling edge
+        0, 1, // rising edge captures 0
+    };
+    const auto solved = circuitmind::simulateDigitalWaveform(circuit, samples, 6, 0.25);
+    const std::uint8_t expected[] = {0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 0, 1};
+    assert(solved.sample_times_s.size() == 6 && solved.output_count == 2);
+    for (std::size_t index = 0; index < 12; ++index) assert(solved.output_values[index] == expected[index]);
+    for (std::size_t sample = 0; sample < 6; ++sample) {
+        assert(std::abs(solved.sample_times_s[sample] - sample * 0.25) < 1e-15);
+    }
+
+    const cm_digital_waveform_gate_v1 gates[] = {
+        {8, 0, 1, 2, 1}, {0, 2, 0, 3, 0},
+    };
+    const std::uint32_t inputs[] = {0, 1};
+    const std::uint32_t outputs[] = {2, 3};
+    const std::uint8_t native_samples[] = {0, 0, 0, 1, 1, 1};
+    const cm_digital_waveform_request_v1 request{1, 4, 2, gates, 2, inputs, 2, outputs,
+                                                  3, native_samples, 1.0};
+    double times[3]{};
+    std::uint8_t values[6]{};
+    cm_digital_waveform_result_v1 output{times, 3, values, 6, 0, 0};
+    char error[256]{};
+    const int status = cm_engine_simulate_digital_waveform_v1(&request, &output, error, sizeof(error));
+    assert(status == 0 && output.sample_count == 3 && output.output_count == 2);
+    const std::uint8_t expected_native[] = {1, 0, 0, 1, 0, 1};
+    for (std::size_t index = 0; index < 6; ++index) assert(values[index] == expected_native[index]);
+    assert(times[0] == 0.0 && times[1] == 1.0 && times[2] == 2.0);
+
+    const cm_digital_waveform_gate_v1 falling_gate[] = {{8, 0, 1, 2, 0, 1}};
+    const std::uint8_t falling_samples[] = {0, 1, 1, 0, 0, 0, 0, 1, 0, 0};
+    const cm_digital_waveform_request_v1 falling_request{1, 3, 1, falling_gate, 2, inputs, 1, outputs,
+                                                          5, falling_samples, 1.0};
+    double falling_times[5]{};
+    std::uint8_t falling_values[5]{};
+    cm_digital_waveform_result_v1 falling_output{falling_times, 5, falling_values, 5, 0, 0};
+    assert(cm_engine_simulate_digital_waveform_v1(&falling_request, &falling_output, error, sizeof(error)) == 0);
+    const std::uint8_t expected_falling[] = {0, 1, 1, 1, 0};
+    for (std::size_t index = 0; index < 5; ++index) assert(falling_values[index] == expected_falling[index]);
+    const cm_digital_waveform_gate_v1 invalid_edge_gate[] = {{8, 0, 1, 2, 0, 2}};
+    const cm_digital_waveform_request_v1 invalid_edge_request{1, 3, 1, invalid_edge_gate, 2, inputs, 1, outputs,
+                                                               3, native_samples, 1.0};
+    assert(cm_engine_simulate_digital_waveform_v1(&invalid_edge_request, &falling_output,
+                                                   error, sizeof(error)) != 0);
+    assert(std::string_view(error).find("active edge") != std::string_view::npos);
+
+    const std::uint8_t invalid_samples[] = {0, 0, 2, 1, 1, 1};
+    const cm_digital_waveform_request_v1 invalid_request{1, 4, 2, gates, 2, inputs, 2, outputs,
+                                                          3, invalid_samples, 1.0};
+    assert(cm_engine_simulate_digital_waveform_v1(&invalid_request, &output, error, sizeof(error)) != 0);
+    assert(std::string_view(error).find("binary") != std::string_view::npos);
+    output.output_capacity = 1;
+    assert(cm_engine_simulate_digital_waveform_v1(&request, &output, error, sizeof(error)) != 0);
+    assert(std::string_view(error).find("too small") != std::string_view::npos);
+
+    bool invalid_interval_rejected = false;
+    try {
+        (void)circuitmind::simulateDigitalWaveform(circuit, samples, 6, 0.0);
+    } catch (const circuitmind::SolverError&) { invalid_interval_rejected = true; }
+    assert(invalid_interval_rejected);
+}
+
 void testNativeDcSweepApi() {
     Circuit circuit{3, 0, {
         {ElementKind::VoltageSource, 1, 0, 1.0},
@@ -312,6 +433,8 @@ int main() {
     testBackwardEulerRcStep();
     testRejectedSingularAndUnboundedRequests();
     testAcSweepAndCAbi();
+    testDigitalTruthTableAndCAbi();
+    testDigitalSampledWaveformAndCAbi();
     testNativeDcSweepApi();
     testCAbiRoundTrip();
     std::cout << "CircuitMind C++ core tests passed\n";

@@ -1,10 +1,12 @@
 #include "circuitmind/engine.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <complex>
 #include <limits>
 #include <numeric>
+#include <queue>
 #include <set>
 #include <sstream>
 #include <utility>
@@ -416,10 +418,151 @@ DcResult solveShockleyDiodeCircuit(const Circuit& circuit) {
     return result;
 }
 
+struct DigitalEvaluationPlan {
+    std::vector<bool> is_primary_input;
+    std::vector<std::size_t> gate_order;
+};
+
+DigitalEvaluationPlan buildDigitalEvaluationPlan(const DigitalCircuit& circuit,
+                                                  std::size_t maximum_inputs,
+                                                  bool allow_flip_flops) {
+    constexpr std::size_t maximum_nets = 256;
+    constexpr std::size_t maximum_gates = 512;
+    constexpr std::size_t maximum_outputs = 32;
+    const auto no_index = std::numeric_limits<std::size_t>::max();
+    if (circuit.net_count == 0 || circuit.net_count > maximum_nets) {
+        throw SolverError("digital net count must be between 1 and 256");
+    }
+    if (circuit.gates.empty() || circuit.gates.size() > maximum_gates) {
+        throw SolverError("digital circuit must contain between 1 and 512 gates");
+    }
+    if (circuit.input_nets.empty() || circuit.input_nets.size() > maximum_inputs) {
+        throw SolverError("digital primary input count exceeds the configured limit");
+    }
+    if (circuit.output_nets.empty() || circuit.output_nets.size() > maximum_outputs) {
+        throw SolverError("digital circuit must contain between 1 and 32 outputs");
+    }
+
+    DigitalEvaluationPlan plan;
+    plan.is_primary_input.assign(circuit.net_count, false);
+    for (const auto net : circuit.input_nets) {
+        if (net >= circuit.net_count) throw SolverError("digital primary input net is outside the net range");
+        if (plan.is_primary_input[net]) throw SolverError("digital primary input nets must be unique");
+        plan.is_primary_input[net] = true;
+    }
+    std::vector<bool> is_output(circuit.net_count, false);
+    for (const auto net : circuit.output_nets) {
+        if (net >= circuit.net_count) throw SolverError("digital output net is outside the net range");
+        if (is_output[net]) throw SolverError("digital output nets must be unique");
+        is_output[net] = true;
+    }
+
+    std::vector<std::size_t> driver(circuit.net_count, no_index);
+    std::vector<std::vector<std::size_t>> dependents(circuit.gates.size());
+    std::vector<std::size_t> indegree(circuit.gates.size(), 0);
+    for (std::size_t index = 0; index < circuit.gates.size(); ++index) {
+        const auto& gate = circuit.gates[index];
+        const bool unary = gate.kind == DigitalGateKind::Not || gate.kind == DigitalGateKind::Buffer;
+        const bool flip_flop = gate.kind == DigitalGateKind::DFlipFlop;
+        switch (gate.kind) {
+        case DigitalGateKind::Not:
+        case DigitalGateKind::Buffer:
+        case DigitalGateKind::And:
+        case DigitalGateKind::Or:
+        case DigitalGateKind::Xor:
+        case DigitalGateKind::Nand:
+        case DigitalGateKind::Nor:
+        case DigitalGateKind::Xnor:
+            break;
+        case DigitalGateKind::DFlipFlop:
+            if (!allow_flip_flops) throw SolverError("sequential D flip-flops require digital waveform simulation");
+            if (gate.initial_value > 1) throw SolverError("D flip-flop initial state must be 0 or 1");
+            if (gate.active_edge != DigitalClockEdge::Rising && gate.active_edge != DigitalClockEdge::Falling) {
+                throw SolverError("D flip-flop active edge must be rising or falling");
+            }
+            break;
+        default:
+            throw SolverError("digital gate has an unsupported logic kind");
+        }
+        if (gate.output >= circuit.net_count || gate.input_a >= circuit.net_count ||
+            (!unary && gate.input_b >= circuit.net_count)) {
+            throw SolverError("digital gate references a net outside the configured range");
+        }
+        if (plan.is_primary_input[gate.output]) throw SolverError("primary input nets cannot also be driven by a logic gate");
+        if (driver[gate.output] != no_index) throw SolverError("each digital net may have at most one gate driver");
+        driver[gate.output] = index;
+        (void)flip_flop;
+    }
+
+    for (std::size_t index = 0; index < circuit.gates.size(); ++index) {
+        const auto& gate = circuit.gates[index];
+        const bool unary = gate.kind == DigitalGateKind::Not || gate.kind == DigitalGateKind::Buffer;
+        const bool flip_flop = gate.kind == DigitalGateKind::DFlipFlop;
+        const std::array<std::size_t, 2> inputs{gate.input_a, gate.input_b};
+        const std::size_t input_count = unary ? 1 : 2;
+        std::set<std::size_t> unique_dependencies;
+        for (std::size_t pin = 0; pin < input_count; ++pin) {
+            const auto input_net = inputs[pin];
+            if (plan.is_primary_input[input_net]) continue;
+            if (driver[input_net] == no_index) throw SolverError("digital gate input net has no primary input or gate driver");
+            if (!flip_flop) unique_dependencies.insert(driver[input_net]);
+        }
+        indegree[index] = unique_dependencies.size();
+        for (const auto dependency : unique_dependencies) dependents[dependency].push_back(index);
+    }
+    for (const auto net : circuit.output_nets) {
+        if (!plan.is_primary_input[net] && driver[net] == no_index) {
+            throw SolverError("digital output net has no primary input or gate driver");
+        }
+    }
+
+    std::queue<std::size_t> ready;
+    for (std::size_t index = 0; index < indegree.size(); ++index) {
+        if (indegree[index] == 0) ready.push(index);
+    }
+    plan.gate_order.reserve(circuit.gates.size());
+    while (!ready.empty()) {
+        const auto gate_index = ready.front();
+        ready.pop();
+        plan.gate_order.push_back(gate_index);
+        for (const auto dependent : dependents[gate_index]) {
+            if (--indegree[dependent] == 0) ready.push(dependent);
+        }
+    }
+    if (plan.gate_order.size() != circuit.gates.size()) {
+        throw SolverError("combinational portion of digital circuit contains a logic loop");
+    }
+    return plan;
+}
+
+void evaluateDigitalCombinational(const DigitalCircuit& circuit,
+                                  const std::vector<std::size_t>& gate_order,
+                                  std::vector<std::uint8_t>& values) {
+    for (const auto gate_index : gate_order) {
+        const auto& gate = circuit.gates[gate_index];
+        if (gate.kind == DigitalGateKind::DFlipFlop) continue;
+        const bool a = values[gate.input_a] != 0;
+        const bool b = values[gate.input_b] != 0;
+        bool output = false;
+        switch (gate.kind) {
+        case DigitalGateKind::Not: output = !a; break;
+        case DigitalGateKind::Buffer: output = a; break;
+        case DigitalGateKind::And: output = a && b; break;
+        case DigitalGateKind::Or: output = a || b; break;
+        case DigitalGateKind::Xor: output = a != b; break;
+        case DigitalGateKind::Nand: output = !(a && b); break;
+        case DigitalGateKind::Nor: output = !(a || b); break;
+        case DigitalGateKind::Xnor: output = a == b; break;
+        case DigitalGateKind::DFlipFlop: break;
+        }
+        values[gate.output] = static_cast<std::uint8_t>(output ? 1 : 0);
+    }
+}
+
 } // namespace
 
 const char* engineVersion() noexcept {
-    return "0.2.0";
+    return "0.3.0";
 }
 
 DcResult solveDc(const Circuit& circuit) {
@@ -930,6 +1073,102 @@ AcSweepResult simulateAcSweep(const AcCircuit& circuit, const std::vector<double
             result.node_voltage_real_v[output_index] = value.real();
             result.node_voltage_imag_v[output_index] = value.imag();
         }
+    }
+    return result;
+}
+
+DigitalTruthTableResult simulateDigitalTruthTable(const DigitalCircuit& circuit) {
+    constexpr std::size_t maximum_inputs = 10;
+    const auto plan = buildDigitalEvaluationPlan(circuit, maximum_inputs, false);
+    const std::size_t row_count = std::size_t{1} << circuit.input_nets.size();
+    DigitalTruthTableResult result;
+    result.row_count = row_count;
+    result.output_count = circuit.output_nets.size();
+    result.output_values.reserve(row_count * result.output_count);
+    std::vector<std::uint8_t> values(circuit.net_count, 0);
+    for (std::size_t row = 0; row < row_count; ++row) {
+        std::fill(values.begin(), values.end(), 0);
+        for (std::size_t input = 0; input < circuit.input_nets.size(); ++input) {
+            const auto bit_position = circuit.input_nets.size() - input - 1;
+            values[circuit.input_nets[input]] = static_cast<std::uint8_t>((row >> bit_position) & 1U);
+        }
+        evaluateDigitalCombinational(circuit, plan.gate_order, values);
+        for (const auto output_net : circuit.output_nets) result.output_values.push_back(values[output_net]);
+    }
+    return result;
+}
+
+DigitalWaveformResult simulateDigitalWaveform(const DigitalCircuit& circuit,
+                                              const std::vector<std::uint8_t>& primary_input_samples,
+                                              std::size_t sample_count,
+                                              double sample_interval_s) {
+    constexpr std::size_t maximum_primary_inputs = 32;
+    constexpr std::size_t maximum_samples = 10000;
+    requireFinite(sample_interval_s, "digital sample interval");
+    if (sample_interval_s <= 0.0) throw SolverError("digital sample interval must be positive");
+    if (sample_count == 0 || sample_count > maximum_samples) {
+        throw SolverError("digital waveform must contain between 1 and 10000 samples");
+    }
+    if (circuit.input_nets.size() > maximum_primary_inputs ||
+        primary_input_samples.size() != sample_count * circuit.input_nets.size()) {
+        throw SolverError("digital primary-input sample buffer has an invalid shape");
+    }
+    if (std::any_of(primary_input_samples.begin(), primary_input_samples.end(),
+                    [](std::uint8_t value) { return value > 1; })) {
+        throw SolverError("digital primary-input samples must be binary 0/1 values");
+    }
+    const auto plan = buildDigitalEvaluationPlan(circuit, maximum_primary_inputs, true);
+    std::vector<std::uint8_t> state(circuit.gates.size(), 0);
+    std::vector<std::uint8_t> previous_clock(circuit.gates.size(), 0);
+    for (std::size_t index = 0; index < circuit.gates.size(); ++index) {
+        if (circuit.gates[index].kind == DigitalGateKind::DFlipFlop) {
+            state[index] = circuit.gates[index].initial_value;
+        }
+    }
+
+    DigitalWaveformResult result;
+    result.output_count = circuit.output_nets.size();
+    result.sample_times_s.reserve(sample_count);
+    result.output_values.reserve(sample_count * result.output_count);
+    std::vector<std::uint8_t> values(circuit.net_count, 0);
+    for (std::size_t sample = 0; sample < sample_count; ++sample) {
+        std::fill(values.begin(), values.end(), 0);
+        for (std::size_t input = 0; input < circuit.input_nets.size(); ++input) {
+            values[circuit.input_nets[input]] = primary_input_samples[sample * circuit.input_nets.size() + input];
+        }
+        for (std::size_t index = 0; index < circuit.gates.size(); ++index) {
+            if (circuit.gates[index].kind == DigitalGateKind::DFlipFlop) {
+                values[circuit.gates[index].output] = state[index];
+            }
+        }
+        evaluateDigitalCombinational(circuit, plan.gate_order, values);
+
+        auto next_state = state;
+        bool state_changed = false;
+        for (std::size_t index = 0; index < circuit.gates.size(); ++index) {
+            const auto& gate = circuit.gates[index];
+            if (gate.kind != DigitalGateKind::DFlipFlop) continue;
+            const auto clock = values[gate.input_b];
+            const bool rising_edge = previous_clock[index] == 0 && clock != 0;
+            const bool falling_edge = previous_clock[index] != 0 && clock == 0;
+            const bool active_edge = gate.active_edge == DigitalClockEdge::Rising ? rising_edge : falling_edge;
+            if (active_edge) next_state[index] = values[gate.input_a];
+            previous_clock[index] = clock;
+            state_changed = state_changed || next_state[index] != state[index];
+        }
+        if (state_changed) {
+            state = std::move(next_state);
+            for (std::size_t index = 0; index < circuit.gates.size(); ++index) {
+                if (circuit.gates[index].kind == DigitalGateKind::DFlipFlop) {
+                    values[circuit.gates[index].output] = state[index];
+                }
+            }
+            evaluateDigitalCombinational(circuit, plan.gate_order, values);
+        }
+        const double sample_time = static_cast<double>(sample) * sample_interval_s;
+        requireFinite(sample_time, "digital sample time");
+        result.sample_times_s.push_back(sample_time);
+        for (const auto output_net : circuit.output_nets) result.output_values.push_back(values[output_net]);
     }
     return result;
 }

@@ -1,28 +1,50 @@
 """Local HTTP API and static application server."""
 from __future__ import annotations
 
+import csv
 import hashlib
+import io
 import json
 import mimetypes
 import os
+import shutil
+import tempfile
 import threading
+import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from . import __version__
-from .circuit_schema import export_kicad_netlist, migrate_model, validate_model
+from .circuit_schema import export_kicad_netlist, migrate_model, model_digest, validate_model
 from .integrations import discover_integrations, run_kicad_drc, run_kicad_erc, run_ngspice, run_pdftotext
 from .kicad_symbols import resolve_kicad_symbol
 from .engineering import (clock_divider_candidate, clock_timebase_error, led_series_resistor,
                           solve_dc_operating_point, simulate_dc_sweep, map_circuit_graph_to_mna, map_circuit_graph_to_ac,
-                          simulate_transient_rc, simulate_ac_sweep, synthesize_rc_lowpass)
+                          simulate_transient_rc, simulate_ac_sweep, simulate_digital_truth_table,
+                          simulate_digital_waveform, synthesize_rc_lowpass)
 from .engineering.cpp_engine import CppEngineUnavailable
+from .engineering.operating_limits import assess_operating_limits, assess_transient_reactive_limits
 from .spice import validate_spice_deck
+from .firmware import generate_esp32_scaffold
+from .connectivity_schedule import build_connectivity_schedule
 from .models import ProjectInput
 from .project_store import list_snapshots, load_circuit, restore_snapshot, save_circuit
+from .project_archive import MAX_ARCHIVE_BYTES, read_project_archive
+from .agent_tools import (APPROVAL_TOOL_CATALOG, TOOL_CATALOG,
+                          execute_agent_tool, list_agent_tools)
+from .agent_audit import append_agent_actions, verify_agent_actions
+from .agent_providers import (AgentProviderError, generate_agent_plan,
+                              generate_evidence_summary, probe_agent_provider,
+                              provider_configuration_status)
+from .agent_planner import (agent_plan_digest, build_compact_execution_evidence,
+                            check_read_only_execution, execution_report_digest,
+                            parse_evidence_summary, parse_read_only_plan,
+                            resolve_evidence_values, summary_report_digest,
+                            available_evidence_keys)
+from .agent_workflows import CIRCUIT_REVIEW_STEPS, WORKFLOW_CATALOG, evaluate_circuit_review
 from .workflow import analyze, make_zip
 
 
@@ -30,6 +52,8 @@ ROOT = Path(__file__).resolve().parent.parent
 WEB = ROOT / "web"
 DATA_DIR = Path(os.environ.get("CIRCUITMIND_DATA_DIR", ROOT / "workspace")).expanduser().resolve()
 MAX_BODY = 1_000_000
+MAX_AGENT_REPORT_BYTES = 4_000_000
+MAX_AGENT_SUMMARY_BYTES = 256_000
 MAX_SCHEMATIC_BODY = 24_000_000
 MAX_SCHEMATIC_FILE = 12_000_000
 MAX_DATASHEET_FILE = 20_000_000
@@ -68,6 +92,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "version": __version__})
         if parsed.path == "/api/integrations":
             return self._json(200, {"integrations": discover_integrations()})
+        if parsed.path == "/api/agent/tools":
+            return self._json(200, {"tools": list_agent_tools() + [dict(tool) for tool in APPROVAL_TOOL_CATALOG],
+                                    "scope": "Provider-neutral registry only. Read-only tools execute directly; circuit replacement requires a separate review and approval step. No model provider or autonomous planning is connected."})
+        if parsed.path == "/api/agent/workflows":
+            return self._json(200, {"workflows": [dict(workflow) for workflow in WORKFLOW_CATALOG],
+                                    "scope": "Finite deterministic workflows with explicit checks; no LLM planning or electrical design approval."})
+        if parsed.path == "/api/agent/providers":
+            return self._json(200, {"provider": provider_configuration_status(),
+                                    "scope": "Reads environment configuration only; does not contact a provider."})
         if parsed.path == "/api/projects":
             directory = DATA_DIR / "projects"
             records = []
@@ -79,6 +112,169 @@ class Handler(BaseHTTPRequestHandler):
                         continue
             return self._json(200, {"projects": records})
         parts = parsed.path.strip("/").split("/")
+        if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["agent", "proposals"]:
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            try:
+                proposals = []
+                for proposal_path in sorted(folder.glob("agent_proposal_*.json"), key=lambda item: item.stat().st_mtime, reverse=True)[:100]:
+                    proposal_id = proposal_path.stem.removeprefix("agent_proposal_")
+                    proposal = _read_agent_proposal(folder, proposal_id)
+                    if proposal.get("project_id") != project_id:
+                        raise ValueError("Agent proposal belongs to a different project")
+                    proposals.append(_agent_proposal_summary(proposal))
+                return self._json(200, {"project_id": project_id, "proposals": proposals})
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                return self._json(500, {"error": f"Agent proposals could not be read: {exc}"})
+        if len(parts) == 6 and parts[:2] == ["api", "projects"] and parts[3] == "agent" and parts[4] == "proposals":
+            project_id, proposal_id = parts[2], parts[5]
+            if not _valid_id(project_id) or not _valid_agent_proposal_id(proposal_id):
+                return self._json(400, {"error": "Invalid project or proposal id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            try:
+                proposal = _read_agent_proposal(folder, proposal_id)
+                if proposal.get("project_id") != project_id:
+                    raise ValueError("Agent proposal belongs to a different project")
+                return self._json(200, {"proposal": proposal})
+            except FileNotFoundError:
+                return self._json(404, {"error": "Agent proposal not found"})
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                return self._json(500, {"error": f"Agent proposal could not be read: {exc}"})
+        if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["agent", "executions"]:
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            items = []
+            try:
+                paths = sorted(folder.glob("agent_execution_*.json"), key=lambda item: item.stat().st_mtime, reverse=True)[:50]
+                for report_path in paths:
+                    execution_id = report_path.stem.removeprefix("agent_execution_")
+                    if not _valid_agent_plan_id(execution_id):
+                        continue
+                    try:
+                        report, _report_hash, _chain = _load_verified_agent_execution(folder, project_id, execution_id)
+                        items.append({"execution_id": execution_id, "created_at": report.get("created_at"),
+                                      "status": report.get("status"), "integrity": "verified",
+                                      "artifact": report_path.name})
+                    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+                        items.append({"execution_id": execution_id, "integrity": "invalid-or-unlinked",
+                                      "error": str(exc)[:200], "artifact": report_path.name})
+                return self._json(200, {"project_id": project_id, "executions": items,
+                                        "scope": "Only report digests and intact audit-chain links establish artifact integrity, not tool-result truth or electrical/design correctness."})
+            except OSError as exc:
+                return self._json(500, {"error": f"Agent executions could not be listed: {exc}"})
+        if len(parts) == 6 and parts[:2] == ["api", "projects"] and parts[3:5] == ["agent", "executions"]:
+            project_id, execution_id = parts[2], parts[5]
+            if not _valid_id(project_id) or not _valid_agent_plan_id(execution_id):
+                return self._json(400, {"error": "Invalid project or execution id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            try:
+                report, report_hash, chain = _load_verified_agent_execution(folder, project_id, execution_id)
+                return self._json(200, {"report": report, "report_sha256": report_hash,
+                                        "chain_integrity": chain,
+                                        "scope": "This verifies the saved report digest and audit link only; tool output consistency does not establish electrical correctness or design approval."})
+            except FileNotFoundError:
+                return self._json(404, {"error": "Agent execution report not found"})
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+                return self._json(409, {"error": f"Agent execution report failed integrity verification: {exc}"})
+        if len(parts) == 7 and parts[:2] == ["api", "projects"] and parts[3:5] == ["agent", "executions"] and parts[6] == "summaries":
+            project_id, execution_id = parts[2], parts[5]
+            if not _valid_id(project_id) or not _valid_agent_plan_id(execution_id):
+                return self._json(400, {"error": "Invalid project or execution id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            try:
+                execution_name = f"agent_execution_{execution_id}.json"
+                execution_path = folder / execution_name
+                if not execution_path.is_file():
+                    return self._json(404, {"error": "Agent execution report not found"})
+                if execution_path.stat().st_size > MAX_AGENT_REPORT_BYTES:
+                    return self._json(409, {"error": "Execution report exceeds the verification size limit"})
+                execution_bytes = execution_path.read_bytes()
+                execution = json.loads(execution_bytes.decode("utf-8"))
+                execution_hash = hashlib.sha256(execution_bytes).hexdigest()
+                if (not isinstance(execution, dict) or execution.get("execution_id") != execution_id or
+                        execution.get("project_id") != project_id or execution.get("artifact") != execution_name or
+                        execution_report_digest(execution) != execution.get("execution_report_sha256")):
+                    return self._json(409, {"error": "Execution report identity or integrity check failed"})
+                evidence = execution.get("evidence")
+                if not isinstance(evidence, dict):
+                    return self._json(409, {"error": "Execution report has no verifiable evidence"})
+                evidence_bytes = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+                evidence_hash = hashlib.sha256(evidence_bytes).hexdigest()
+                action_path = folder / "agent_actions.jsonl"
+                rows, chain = verify_agent_actions(action_path.read_text("utf-8") if action_path.is_file() else "")
+                source_linked = any(row.get("tool") == "agent.plan.execute" and
+                                    row.get("execution_id") == execution_id and
+                                    row.get("result_sha256") == execution_hash for row in rows)
+                if chain.get("status") != "intact" or not source_linked:
+                    return self._json(409, {"error": "Execution report is not linked to an intact audit chain"})
+                summaries = []
+                paths = sorted(folder.glob(f"agent_summary_*.json"), key=lambda item: item.stat().st_mtime, reverse=True)[:50]
+                for summary_path in paths:
+                    try:
+                        if summary_path.stat().st_size > MAX_AGENT_SUMMARY_BYTES:
+                            raise ValueError("Saved summary exceeds the verification size limit")
+                        raw = summary_path.read_bytes()
+                        summary = json.loads(raw.decode("utf-8"))
+                        if isinstance(summary, dict) and summary.get("execution_id") != execution_id:
+                            continue
+                        expected_artifact = summary_path.name
+                        audited = any(row.get("tool") == "agent.execution.summarize" and
+                                      row.get("status") == "ai-generated-unverified" and
+                                      row.get("result_sha256") == hashlib.sha256(raw).hexdigest()
+                                      for row in rows)
+                        valid = (isinstance(summary, dict) and summary.get("project_id") == project_id and
+                                 summary.get("execution_id") == execution_id and summary.get("artifact") == expected_artifact and
+                                 summary.get("source_execution_report_sha256") == execution_hash and
+                                 summary.get("evidence_sha256") == evidence_hash and
+                                 summary_report_digest(summary) == summary.get("summary_report_sha256") and
+                                 summary.get("cited_evidence") == resolve_evidence_values(evidence, summary.get("evidence_keys", [])) and
+                                 audited)
+                        if valid:
+                            summaries.append({"integrity": "verified", "report": summary})
+                        else:
+                            summaries.append({"integrity": "invalid-or-unlinked", "artifact": expected_artifact,
+                                              "error": "Summary identity, digest, cited evidence, or audit link did not verify"})
+                    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError):
+                        summaries.append({"integrity": "invalid-or-unlinked", "artifact": summary_path.name,
+                                          "error": "Saved summary could not be verified"})
+                return self._json(200, {"project_id": project_id, "execution_id": execution_id,
+                                        "source_execution_report_sha256": execution_hash,
+                                        "chain_integrity": chain, "summaries": summaries,
+                                        "scope": "Verified summary digests and audit links prove artifact consistency, not narrative truth or electrical/design correctness."})
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+                return self._json(500, {"error": f"Agent summaries could not be verified: {exc}"})
+        if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["agent", "actions"]:
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            action_path = folder / "agent_actions.jsonl"
+            try:
+                text = action_path.read_text("utf-8") if action_path.is_file() else ""
+                records, integrity = verify_agent_actions(text)
+                visible = records[-500:]
+                return self._json(200, {"project_id": project_id, "count": len(visible),
+                                        "total_count": integrity.get("total_count"), "actions": visible,
+                                        "chain_integrity": integrity,
+                                        "scope": "The hash chain detects accidental or partial edits but is unsigned; it does not prevent complete log rewriting. Full tool outputs are not retained."})
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+                return self._json(500, {"error": f"Agent action log could not be read: {exc}"})
         if len(parts) == 4 and parts[:2] == ["api", "projects"] and parts[3] == "calculations":
             project_id = parts[2]
             if not _valid_id(project_id):
@@ -117,10 +313,11 @@ class Handler(BaseHTTPRequestHandler):
                 current_hash = hashlib.sha256(json.dumps(model, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
                 runs = []
                 report_paths = sorted([*folder.glob("simulation_mna_*.json"), *folder.glob("simulation_transient_rc_*.json"), *folder.glob("simulation_transient_rlc_*.json"),
-                                       *folder.glob("simulation_ac_sweep_*.json"), *folder.glob("simulation_dc_sweep_*.json")])
+                                       *folder.glob("simulation_ac_sweep_*.json"), *folder.glob("simulation_dc_sweep_*.json"),
+                                       *folder.glob("simulation_digital_*.json")])
                 for report_path in report_paths:
                     report = json.loads(report_path.read_text("utf-8"))
-                    if report.get("kind") not in {"linear_dc_mna_operating_point", "piecewise_linear_diode_dc_operating_point", "shockley_diode_dc_operating_point", "circuit_graph_bound_linear_dc_mna_operating_point", "circuit_graph_bound_piecewise_linear_diode_dc_operating_point", "circuit_graph_bound_shockley_diode_dc_operating_point", "circuit_graph_bound_linear_rc_transient", "circuit_graph_bound_linear_rlc_transient", "linear_ac_sweep", "circuit_graph_bound_linear_ac_sweep", "linear_dc_source_sweep", "bounded_diode_dc_source_sweep", "circuit_graph_bound_linear_dc_source_sweep", "circuit_graph_bound_bounded_diode_dc_source_sweep"}:
+                    if report.get("kind") not in {"linear_dc_mna_operating_point", "piecewise_linear_diode_dc_operating_point", "shockley_diode_dc_operating_point", "circuit_graph_bound_linear_dc_mna_operating_point", "circuit_graph_bound_piecewise_linear_diode_dc_operating_point", "circuit_graph_bound_shockley_diode_dc_operating_point", "circuit_graph_bound_linear_rc_transient", "circuit_graph_bound_linear_rlc_transient", "linear_ac_sweep", "circuit_graph_bound_linear_ac_sweep", "linear_dc_source_sweep", "bounded_diode_dc_source_sweep", "circuit_graph_bound_linear_dc_source_sweep", "circuit_graph_bound_bounded_diode_dc_source_sweep", "digital_truth_table", "digital_waveform"}:
                         continue
                     netlist = report.get("input_netlist", report.get("generated_netlist"))
                     recorded_netlist_hash = report.get("netlist_sha256")
@@ -175,6 +372,24 @@ class Handler(BaseHTTPRequestHandler):
                                    "final_node_voltage_magnitudes_v": {node: trace[-1] for node, trace in magnitudes.items() if trace},
                                    "final_node_voltage_phases_deg": {node: trace[-1] for node, trace in phases.items() if trace},
                                    "trace_node_count": len(magnitudes)}
+                    elif isinstance(outputs, dict) and "waveform" in outputs:
+                        waveform = outputs.get("waveform", [])
+                        outputs = {"status": outputs.get("status"), "sample_count": len(waveform),
+                                   "sample_interval_s": outputs.get("sample_interval_s"),
+                                   "final_time_s": waveform[-1].get("time_s") if waveform else None,
+                                   "primary_input_count": len(outputs.get("primary_inputs", [])),
+                                   "primary_output_count": len(outputs.get("primary_outputs", [])),
+                                   "gate_count": outputs.get("gate_count"),
+                                   "primary_inputs": outputs.get("primary_inputs", []),
+                                   "primary_outputs": outputs.get("primary_outputs", []),
+                                   "final_outputs": waveform[-1].get("outputs", {}) if waveform else {}}
+                    elif isinstance(outputs, dict) and "truth_table" in outputs:
+                        outputs = {"status": outputs.get("status"), "row_count": outputs.get("row_count"),
+                                   "primary_input_count": len(outputs.get("primary_inputs", [])),
+                                   "primary_output_count": len(outputs.get("primary_outputs", [])),
+                                   "gate_count": outputs.get("gate_count"),
+                                   "primary_inputs": outputs.get("primary_inputs", []),
+                                   "primary_outputs": outputs.get("primary_outputs", [])}
                     runs.append({"run_id": report.get("run_id"), "kind": report.get("kind"),
                                  "created_at": report.get("created_at"), "artifact": report_path.name,
                                  "model_status": "same-at-run" if report.get("circuit_model_sha256") == current_hash else "model-changed-since-run",
@@ -244,9 +459,12 @@ class Handler(BaseHTTPRequestHandler):
             if not _valid_id(project_id) or filename not in _allowed_artifacts(project_id):
                 return self._json(404, {"error": "Artifact not found"})
             payload = (DATA_DIR / "projects" / project_id / filename).read_bytes()
-            if filename.endswith((".raw", ".pdf")):
+            if filename.endswith((".raw", ".pdf", ".zip", ".csv")):
                 self.send_response(200)
-                self.send_header("Content-Type", "application/pdf" if filename.endswith(".pdf") else "application/octet-stream")
+                content_type = ("application/pdf" if filename.endswith(".pdf") else
+                                "application/zip" if filename.endswith(".zip") else
+                                "text/csv; charset=utf-8" if filename.endswith(".csv") else "application/octet-stream")
+                self.send_header("Content-Type", content_type)
                 self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
@@ -282,6 +500,551 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         parts = path.strip("/").split("/")
+        if path == "/api/agent/providers/probe":
+            try:
+                payload = self._read_payload(2_000)
+                if payload:
+                    raise ValueError("Provider probe accepts only an empty JSON object")
+                return self._json(200, probe_agent_provider())
+            except RequestTooLarge as exc:
+                return self._json(413, {"error": str(exc)})
+            except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+                return self._json(400, {"error": str(exc)})
+        if len(parts) == 6 and parts[:2] == ["api", "projects"] and parts[3:] == ["agent", "workflows", "run"]:
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            try:
+                payload = self._read_payload(2_000)
+                if set(payload) != {"workflow"} or payload.get("workflow") != "circuit_review":
+                    raise ValueError("Only the deterministic 'circuit_review' workflow is registered")
+                run_id = uuid.uuid4().hex
+                created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                outputs = {}
+                step_records = []
+                audit_rows = []
+                with _project_tool_lock(project_id), _CIRCUIT_API_LOCK:
+                    for tool_name in CIRCUIT_REVIEW_STEPS:
+                        started = time.perf_counter()
+                        try:
+                            output = execute_agent_tool(tool_name, {}, project_id, folder)
+                            outputs[tool_name] = output
+                            output_bytes = json.dumps(output, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+                            output_hash = hashlib.sha256(output_bytes).hexdigest()
+                            step_status = "completed"
+                            error = None
+                        except (OSError, ValueError, json.JSONDecodeError, TypeError) as exc:
+                            output_hash = hashlib.sha256(str(exc).encode("utf-8")).hexdigest()
+                            step_status = "failed"
+                            error = str(exc)
+                        elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
+                        step_records.append({"tool": tool_name, "status": step_status,
+                                             "result_sha256": output_hash, "duration_ms": elapsed_ms,
+                                             "error": error})
+                        audit_rows.append({"execution_id": run_id, "call_id": uuid.uuid4().hex,
+                                           "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                           "tool": tool_name, "permission": "read-only", "status": step_status,
+                                           "arguments_sha256": hashlib.sha256(b"{}").hexdigest(),
+                                           "result_sha256": output_hash, "duration_ms": elapsed_ms})
+                    result = evaluate_circuit_review(project_id, outputs)
+                    report = {"schema_version": 1, "workflow": "circuit_review", "run_id": run_id,
+                              "project_id": project_id, "created_at": created_at, "status": result["status"],
+                              "plan": {"steps": list(CIRCUIT_REVIEW_STEPS),
+                                       "policy": "Execute registered read-only tools in fixed order, then check identity, saved topology, and model-hash consistency."},
+                              "steps": step_records, "result": result}
+                    report_name = f"agent_workflow_{run_id}.json"
+                    report["artifact"] = report_name
+                    report_bytes = (json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+                    _atomic_bytes(folder / report_name, report_bytes)
+                    report_hash = hashlib.sha256(report_bytes).hexdigest()
+                    audit_rows.append({"execution_id": run_id, "call_id": uuid.uuid4().hex,
+                                       "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                       "tool": "workflow.circuit_review", "permission": "read-only",
+                                       "status": result["status"], "arguments_sha256": hashlib.sha256(b"circuit_review").hexdigest(),
+                                       "result_sha256": report_hash, "duration_ms": 0.0})
+                    _append_agent_actions(folder, audit_rows)
+                    _update_project_record(folder)
+                return self._json(201, report)
+            except RequestTooLarge as exc:
+                return self._json(413, {"error": str(exc)})
+            except (UnicodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+                return self._json(400, {"error": str(exc)})
+            except OSError as exc:
+                return self._json(500, {"error": f"Agent workflow could not be stored: {exc}"})
+        if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["agent", "proposals"]:
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            try:
+                payload = self._read_payload(MAX_BODY)
+                if set(payload) != {"tool", "arguments"} or payload.get("tool") != "circuit.replace_model":
+                    raise ValueError("Proposal request must target circuit.replace_model with explicit arguments")
+                arguments = payload["arguments"]
+                if not isinstance(arguments, dict) or set(arguments) != {"model"} or not isinstance(arguments["model"], dict):
+                    raise ValueError("circuit.replace_model arguments must contain one circuit model object")
+                candidate = migrate_model(arguments["model"])
+                validation = validate_model(candidate)
+                if not validation["topology_valid"]:
+                    return self._json(422, {"error": "Proposed circuit model failed schema/topology checks", "topology_report": validation})
+                with _project_tool_lock(project_id), _CIRCUIT_API_LOCK:
+                    current_hash = model_digest(load_circuit(folder))
+                    candidate_hash = model_digest(candidate)
+                    if candidate_hash == current_hash:
+                        raise ValueError("Proposed circuit model is identical to the current saved model")
+                    now = datetime.now(timezone.utc)
+                    proposal_id = uuid.uuid4().hex
+                    proposal = {"proposal_id": proposal_id, "project_id": project_id,
+                                "tool": "circuit.replace_model", "status": "awaiting-approval",
+                                "created_at": now.isoformat(timespec="seconds"),
+                                "expires_at": (now + timedelta(minutes=30)).isoformat(timespec="seconds"),
+                                "base_model_sha256": current_hash, "candidate_model_sha256": candidate_hash,
+                                "validation": validation, "model": candidate,
+                                "scope": "Explicit candidate circuit model; this proposal does not infer values or perform electrical analysis."}
+                    proposal_path = folder / f"agent_proposal_{proposal_id}.json"
+                    _atomic_bytes(proposal_path, (json.dumps(proposal, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8"))
+                    audit = _agent_audit_row("circuit.replace_model", "awaiting-approval", candidate_hash, candidate_hash)
+                    _append_agent_actions(folder, [audit])
+                    _update_project_record(folder)
+                return self._json(201, {"proposal": _agent_proposal_summary(proposal),
+                                        "review_url": f"/api/projects/{project_id}/agent/proposals/{proposal_id}",
+                                        "approval_url": f"/api/projects/{project_id}/agent/proposals/{proposal_id}/approve",
+                                        "requires_separate_approval": True})
+            except RequestTooLarge as exc:
+                return self._json(413, {"error": str(exc)})
+            except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+                return self._json(400, {"error": str(exc)})
+            except (FileNotFoundError, OSError) as exc:
+                return self._json(500, {"error": f"Agent proposal could not be stored: {exc}"})
+        if len(parts) == 7 and parts[:2] == ["api", "projects"] and parts[3] == "agent" and parts[4] == "proposals" and parts[6] == "approve":
+            project_id, proposal_id = parts[2], parts[5]
+            if not _valid_id(project_id) or not _valid_agent_proposal_id(proposal_id):
+                return self._json(400, {"error": "Invalid project or proposal id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            try:
+                payload = self._read_payload(2_000)
+                if set(payload) != {"approve"} or payload.get("approve") is not True:
+                    raise ValueError("Approval requires the explicit JSON body {\"approve\": true}")
+                with _project_tool_lock(project_id), _CIRCUIT_API_LOCK:
+                    proposal = _read_agent_proposal(folder, proposal_id)
+                    if proposal.get("project_id") != project_id:
+                        return self._json(409, {"error": "Agent proposal belongs to a different project"})
+                    if proposal.get("status") != "awaiting-approval":
+                        return self._json(409, {"error": "Agent proposal is no longer awaiting approval"})
+                    expires_at = datetime.fromisoformat(proposal["expires_at"])
+                    if datetime.now(timezone.utc) >= expires_at:
+                        proposal["status"] = "expired"
+                        _atomic_bytes(folder / f"agent_proposal_{proposal_id}.json",
+                                      (json.dumps(proposal, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8"))
+                        _update_project_record(folder)
+                        return self._json(410, {"error": "Agent proposal expired; submit a new proposal"})
+                    current_hash = model_digest(load_circuit(folder))
+                    if current_hash != proposal.get("base_model_sha256"):
+                        proposal["status"] = "stale"
+                        _atomic_bytes(folder / f"agent_proposal_{proposal_id}.json",
+                                      (json.dumps(proposal, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8"))
+                        _update_project_record(folder)
+                        return self._json(409, {"error": "Saved circuit changed since proposal creation; review a fresh proposal"})
+                    candidate = migrate_model(proposal.get("model"))
+                    candidate_hash = model_digest(candidate)
+                    if candidate_hash != proposal.get("candidate_model_sha256"):
+                        return self._json(409, {"error": "Proposal model hash no longer matches its reviewed hash"})
+                    validation = validate_model(candidate)
+                    if not validation["topology_valid"]:
+                        return self._json(422, {"error": "Proposed circuit model no longer passes validation", "topology_report": validation})
+                    snapshots = save_circuit(project_id, folder, candidate)
+                    export_report = _refresh_circuit_artifacts(project_id, folder, candidate)
+                    approved_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    proposal.update({"status": "approved-and-applied", "approved_at": approved_at,
+                                     "applied_model_sha256": candidate_hash})
+                    _atomic_bytes(folder / f"agent_proposal_{proposal_id}.json",
+                                  (json.dumps(proposal, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8"))
+                    audit = _agent_audit_row("circuit.replace_model", "approved-and-applied", candidate_hash, candidate_hash)
+                    _append_agent_actions(folder, [audit])
+                    _update_project_record(folder)
+                return self._json(200, {"status": "approved-and-applied", "proposal_id": proposal_id,
+                                        "circuit_model_sha256": candidate_hash, "topology_report": validation,
+                                        "snapshots": snapshots, "kicad_export": export_report,
+                                        "scope": "The explicitly proposed model was applied after a separate approval request. Topology checks are not electrical analysis or design approval."})
+            except RequestTooLarge as exc:
+                return self._json(413, {"error": str(exc)})
+            except FileNotFoundError:
+                return self._json(404, {"error": "Agent proposal not found"})
+            except (UnicodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+                return self._json(400, {"error": str(exc)})
+            except OSError as exc:
+                return self._json(500, {"error": f"Agent proposal could not be applied: {exc}"})
+        if len(parts) == 7 and parts[:2] == ["api", "projects"] and parts[3] == "agent" and parts[4] == "executions" and parts[6] == "summarize":
+            project_id, execution_id = parts[2], parts[5]
+            if not _valid_id(project_id) or not _valid_agent_plan_id(execution_id):
+                return self._json(400, {"error": "Invalid project or execution id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            try:
+                payload = self._read_payload(2_000)
+                if payload:
+                    raise ValueError("Evidence summary request accepts only an empty JSON object")
+                report_name = f"agent_execution_{execution_id}.json"
+                report_path = folder / report_name
+                if not report_path.is_file():
+                    return self._json(404, {"error": "Agent execution report not found"})
+                if report_path.stat().st_size > MAX_AGENT_REPORT_BYTES:
+                    return self._json(409, {"error": "Execution report exceeds the verification size limit"})
+                report_bytes = report_path.read_bytes()
+                execution_report = json.loads(report_bytes.decode("utf-8"))
+                if (not isinstance(execution_report, dict) or execution_report.get("execution_id") != execution_id or
+                        execution_report.get("project_id") != project_id or execution_report.get("artifact") != report_name):
+                    return self._json(409, {"error": "Execution report identity check failed"})
+                if execution_report_digest(execution_report) != execution_report.get("execution_report_sha256"):
+                    return self._json(409, {"error": "Execution report integrity check failed"})
+                with _CIRCUIT_API_LOCK:
+                    action_path = folder / "agent_actions.jsonl"
+                    audit_rows, audit_state = verify_agent_actions(action_path.read_text("utf-8") if action_path.is_file() else "")
+                    report_hash = hashlib.sha256(report_bytes).hexdigest()
+                    linked_execution = any(row.get("tool") == "agent.plan.execute" and
+                                           row.get("execution_id") == execution_id and
+                                           row.get("result_sha256") == report_hash for row in audit_rows)
+                    if audit_state.get("status") != "intact" or not linked_execution:
+                        return self._json(409, {"error": "Execution report is not linked to a verified audit-chain record"})
+                evidence = execution_report.get("evidence")
+                if not isinstance(evidence, dict):
+                    return self._json(409, {"error": "Execution report has no compact evidence for summarization"})
+                evidence_bytes = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+                evidence_hash = hashlib.sha256(evidence_bytes).hexdigest()
+                started = time.perf_counter()
+                try:
+                    generated = generate_evidence_summary(evidence)
+                except AgentProviderError as exc:
+                    audit = _agent_audit_row("agent.execution.summarize", "provider-error", evidence_hash,
+                                              hashlib.sha256(str(exc).encode("utf-8")).hexdigest(), permission="summary-only")
+                    audit["duration_ms"] = round((time.perf_counter() - started) * 1000, 3)
+                    with _CIRCUIT_API_LOCK:
+                        _append_agent_actions(folder, [audit]); _update_project_record(folder)
+                    return self._json(exc.status_code, {"error": str(exc)})
+                try:
+                    if generated.get("evidence_sha256") != evidence_hash:
+                        raise ValueError("Provider summary evidence hash does not match the checked execution record")
+                    parsed_summary = parse_evidence_summary(generated["content"], evidence)
+                except ValueError as exc:
+                    audit = _agent_audit_row("agent.execution.summarize", "summary-rejected", evidence_hash,
+                                              generated["completion_sha256"], permission="summary-only")
+                    audit["duration_ms"] = round((time.perf_counter() - started) * 1000, 3)
+                    with _CIRCUIT_API_LOCK:
+                        _append_agent_actions(folder, [audit]); _update_project_record(folder)
+                    return self._json(422, {"error": f"Provider evidence summary rejected by validator: {exc}",
+                                            "completion_sha256": generated["completion_sha256"]})
+                summary_id = uuid.uuid4().hex
+                summary_report = {"schema_version": 1, "summary_id": summary_id,
+                                  "project_id": project_id, "execution_id": execution_id,
+                                  "source_execution_report_sha256": report_hash,
+                                  "evidence_sha256": evidence_hash,
+                                  "provider": generated["provider"], "model": generated["model"],
+                                  "completion_sha256": generated["completion_sha256"],
+                                  "status": "ai-generated-unverified", "summary": parsed_summary["summary"],
+                                  "evidence_keys": parsed_summary["evidence_keys"],
+                                  "cited_evidence": resolve_evidence_values(evidence, parsed_summary["evidence_keys"]),
+                                  "limitations": ["AI-generated explanation of compact tool evidence; not a tool result.",
+                                                  "No electrical, safety, rating, physical-routing, or design-approval conclusion is established."],
+                                  "artifact": f"agent_summary_{summary_id}.json"}
+                summary_report["summary_report_sha256"] = summary_report_digest(summary_report)
+                summary_bytes = (json.dumps(summary_report, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+                audit = _agent_audit_row("agent.execution.summarize", "ai-generated-unverified",
+                                          evidence_hash, hashlib.sha256(summary_bytes).hexdigest(),
+                                          permission="summary-only")
+                audit["duration_ms"] = round((time.perf_counter() - started) * 1000, 3)
+                with _CIRCUIT_API_LOCK:
+                    current_report_bytes = report_path.read_bytes()
+                    current_rows, current_audit_state = verify_agent_actions(
+                        (folder / "agent_actions.jsonl").read_text("utf-8")
+                        if (folder / "agent_actions.jsonl").is_file() else "")
+                    still_linked = any(row.get("tool") == "agent.plan.execute" and
+                                       row.get("execution_id") == execution_id and
+                                       row.get("result_sha256") == report_hash for row in current_rows)
+                    if (hashlib.sha256(current_report_bytes).hexdigest() != report_hash or
+                            current_audit_state.get("status") != "intact" or not still_linked):
+                        return self._json(409, {"error": "Execution evidence changed while the local summary was being generated"})
+                    _atomic_bytes(folder / summary_report["artifact"], summary_bytes)
+                    _append_agent_actions(folder, [audit])
+                    _update_project_record(folder)
+                return self._json(201, summary_report)
+            except RequestTooLarge as exc:
+                return self._json(413, {"error": str(exc)})
+            except FileNotFoundError:
+                return self._json(404, {"error": "Agent execution report not found"})
+            except (UnicodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+                return self._json(400, {"error": str(exc)})
+            except OSError as exc:
+                return self._json(500, {"error": f"Execution evidence could not be summarized: {exc}"})
+        if len(parts) == 7 and parts[:2] == ["api", "projects"] and parts[3] == "agent" and parts[4] == "plans" and parts[6] == "execute":
+            project_id, plan_id = parts[2], parts[5]
+            if not _valid_id(project_id) or not _valid_agent_plan_id(plan_id):
+                return self._json(400, {"error": "Invalid project or plan id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            try:
+                payload = self._read_payload(2_000)
+                if set(payload) != {"execute"} or payload.get("execute") is not True:
+                    raise ValueError("Plan execution requires the explicit JSON body {\"execute\": true}")
+                with _project_tool_lock(project_id), _CIRCUIT_API_LOCK:
+                    plan_record = _read_agent_plan(folder, project_id, plan_id)
+                    if plan_record.get("status") != "awaiting-user-review":
+                        return self._json(409, {"error": "Agent plan is no longer awaiting review"})
+                    parsed_plan = parse_read_only_plan(json.dumps({"summary": plan_record.get("summary"),
+                                                                   "calls": plan_record.get("calls")}))
+                    if agent_plan_digest(plan_record) != plan_record.get("plan_sha256"):
+                        return self._json(409, {"error": "Agent plan hash verification failed; it may have changed since review"})
+                    execution_id = uuid.uuid4().hex
+                    created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    results = []
+                    step_records = []
+                    audit_rows = []
+                    for call in parsed_plan["calls"]:
+                        started = time.perf_counter()
+                        try:
+                            output = execute_agent_tool(call["tool"], call["arguments"], project_id, folder)
+                            result_item = {"tool": call["tool"], "status": "completed", "output": output}
+                            digest_bytes = json.dumps(output, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+                            output_hash = hashlib.sha256(digest_bytes).hexdigest()
+                            error = None
+                        except (OSError, ValueError, json.JSONDecodeError, TypeError) as exc:
+                            result_item = {"tool": call["tool"], "status": "failed", "error": str(exc)}
+                            output_hash = hashlib.sha256(str(exc).encode("utf-8")).hexdigest()
+                            error = str(exc)
+                        elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
+                        result_item["audit"] = {"result_sha256": output_hash, "duration_ms": elapsed_ms}
+                        results.append(result_item)
+                        step_records.append({"tool": call["tool"], "status": result_item["status"],
+                                             "result_sha256": output_hash, "duration_ms": elapsed_ms,
+                                             "error": error})
+                        audit_rows.append({"execution_id": execution_id, "call_id": uuid.uuid4().hex,
+                                           "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                           "tool": call["tool"], "permission": "read-only",
+                                           "status": result_item["status"],
+                                           "arguments_sha256": hashlib.sha256(b"{}").hexdigest(),
+                                           "result_sha256": output_hash, "duration_ms": elapsed_ms})
+                    evaluation = check_read_only_execution(project_id, parsed_plan["calls"], results)
+                    report_name = f"agent_execution_{execution_id}.json"
+                    execution_report = {"schema_version": 1, "execution_id": execution_id,
+                                        "plan_id": plan_id, "plan_sha256": plan_record["plan_sha256"],
+                                        "project_id": project_id, "created_at": created_at,
+                                        "status": evaluation["status"], "steps": step_records,
+                                        "checks": evaluation["checks"],
+                                        "evidence": build_compact_execution_evidence(project_id, parsed_plan["calls"], results, evaluation),
+                                        "limitations": evaluation["limitations"],
+                                        "artifact": report_name}
+                    execution_report["execution_report_sha256"] = execution_report_digest(execution_report)
+                    report_bytes = (json.dumps(execution_report, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+                    report_hash = hashlib.sha256(report_bytes).hexdigest()
+                    plan_record.update({"status": "executed", "executed_at": created_at,
+                                        "execution_status": evaluation["status"],
+                                        "execution_report": report_name})
+                    plan_bytes = (json.dumps(plan_record, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+                    _atomic_bytes(folder / report_name, report_bytes)
+                    _atomic_bytes(folder / f"agent_plan_{plan_id}.json", plan_bytes)
+                    audit_rows.append({"execution_id": execution_id, "call_id": uuid.uuid4().hex,
+                                       "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                                       "tool": "agent.plan.execute", "permission": "read-only",
+                                       "status": evaluation["status"],
+                                       "arguments_sha256": plan_record["plan_sha256"],
+                                       "result_sha256": report_hash, "duration_ms": 0.0})
+                    _append_agent_actions(folder, audit_rows)
+                    _update_project_record(folder)
+                return self._json(201, {"report": execution_report, "calls": results,
+                                        "plan_status": "executed", "scope": "Reviewed read-only calls ran against saved project state. Circuit data was not modified."})
+            except RequestTooLarge as exc:
+                return self._json(413, {"error": str(exc)})
+            except FileNotFoundError:
+                return self._json(404, {"error": "Agent plan not found"})
+            except (UnicodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+                return self._json(400, {"error": str(exc)})
+            except OSError as exc:
+                return self._json(500, {"error": f"Agent plan execution could not be stored: {exc}"})
+        if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["agent", "plan"]:
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            try:
+                payload = self._read_payload(16_000)
+                if set(payload) != {"prompt"}:
+                    raise ValueError("Plan request must contain only a 'prompt' string")
+                prompt = payload["prompt"]
+                if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 2_000:
+                    raise ValueError("Prompt must contain 1 to 2,000 characters")
+                started = time.perf_counter()
+                try:
+                    generated = generate_agent_plan(prompt)
+                except AgentProviderError as exc:
+                    audit = _agent_audit_row("agent.plan", "provider-error",
+                                              hashlib.sha256(prompt.strip().encode("utf-8")).hexdigest(),
+                                              hashlib.sha256(str(exc).encode("utf-8")).hexdigest(),
+                                              permission="plan-only")
+                    audit["duration_ms"] = round((time.perf_counter() - started) * 1000, 3)
+                    with _CIRCUIT_API_LOCK:
+                        _append_agent_actions(folder, [audit])
+                        _update_project_record(folder)
+                    return self._json(exc.status_code, {"error": str(exc)})
+                try:
+                    plan = parse_read_only_plan(generated["content"])
+                except ValueError as exc:
+                    audit = _agent_audit_row("agent.plan", "plan-rejected", generated["prompt_sha256"],
+                                              generated["completion_sha256"], permission="plan-only")
+                    audit["duration_ms"] = round((time.perf_counter() - started) * 1000, 3)
+                    with _CIRCUIT_API_LOCK:
+                        _append_agent_actions(folder, [audit])
+                        _update_project_record(folder)
+                    return self._json(422, {"error": f"Provider plan rejected by the read-only plan validator: {exc}",
+                                            "completion_sha256": generated["completion_sha256"]})
+                plan_id = uuid.uuid4().hex
+                created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                report = {"schema_version": 1, "plan_id": plan_id, "project_id": project_id,
+                          "created_at": created_at, "status": "awaiting-user-review",
+                          "provider": generated["provider"], "model": generated["model"],
+                          "prompt_sha256": generated["prompt_sha256"],
+                          "completion_sha256": generated["completion_sha256"],
+                          "summary": plan["summary"], "calls": plan["calls"],
+                          "artifact": f"agent_plan_{plan_id}.json",
+                          "execution_url": f"/api/projects/{project_id}/agent/plans/{plan_id}/execute",
+                          "scope": "A local model proposed read-only tool calls from the user prompt and tool descriptions only. No project files were sent and no tool has been executed. Review before execution."}
+                report["plan_sha256"] = agent_plan_digest(report)
+                report_bytes = (json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+                audit = _agent_audit_row("agent.plan", "awaiting-user-review", generated["prompt_sha256"],
+                                          generated["completion_sha256"], permission="plan-only")
+                audit["duration_ms"] = round((time.perf_counter() - started) * 1000, 3)
+                with _CIRCUIT_API_LOCK:
+                    _atomic_bytes(folder / report["artifact"], report_bytes)
+                    _append_agent_actions(folder, [audit])
+                    _update_project_record(folder)
+                return self._json(201, report)
+            except RequestTooLarge as exc:
+                return self._json(413, {"error": str(exc)})
+            except (UnicodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+                return self._json(400, {"error": str(exc)})
+            except OSError as exc:
+                return self._json(500, {"error": f"Agent plan could not be stored: {exc}"})
+        if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["agent", "execute"]:
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            try:
+                payload = self._read_payload(64_000)
+                if not isinstance(payload, dict) or set(payload) != {"calls"}:
+                    raise ValueError("Request must contain only a 'calls' array")
+                calls = payload["calls"]
+                if not isinstance(calls, list) or not 1 <= len(calls) <= 8:
+                    raise ValueError("Provide between 1 and 8 tool calls per request")
+                validated_calls = []
+                registered = {tool["name"] for tool in TOOL_CATALOG}
+                for index, call in enumerate(calls):
+                    if not isinstance(call, dict) or set(call) != {"tool", "arguments"}:
+                        raise ValueError(f"Call {index} must contain exactly 'tool' and 'arguments'")
+                    if not isinstance(call["tool"], str):
+                        raise ValueError(f"Call {index} tool name must be a string")
+                    if call["tool"] in {tool["name"] for tool in APPROVAL_TOOL_CATALOG}:
+                        raise ValueError(f"Tool {call['tool']!r} requires the separate proposal and approval flow")
+                    if call["tool"] not in registered:
+                        raise ValueError(f"Call {index} references an unregistered tool")
+                    if not isinstance(call["arguments"], dict) or call["arguments"]:
+                        raise ValueError(f"Tool {call['tool']!r} accepts no arguments")
+                    validated_calls.append(call)
+                execution_id = uuid.uuid4().hex
+                outcomes = []
+                audit_rows = []
+                for call in validated_calls:
+                    started = time.perf_counter()
+                    try:
+                        output = execute_agent_tool(call["tool"], call["arguments"], project_id, folder)
+                        outcome = {"tool": call["tool"], "status": "completed", "output": output}
+                        output_bytes = json.dumps(output, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+                        result_hash = hashlib.sha256(output_bytes).hexdigest()
+                    except (OSError, ValueError, json.JSONDecodeError, TypeError) as exc:
+                        outcome = {"tool": call["tool"], "status": "failed", "error": str(exc)}
+                        result_hash = hashlib.sha256(str(exc).encode("utf-8")).hexdigest()
+                    elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
+                    audit = {"execution_id": execution_id, "call_id": uuid.uuid4().hex,
+                             "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                             "tool": call["tool"], "permission": "read-only", "status": outcome["status"],
+                             "arguments_sha256": hashlib.sha256(b"{}").hexdigest(),
+                             "result_sha256": result_hash, "duration_ms": elapsed_ms}
+                    outcomes.append({**outcome, "audit": audit})
+                    audit_rows.append(audit)
+                with _CIRCUIT_API_LOCK:
+                    _append_agent_actions(folder, audit_rows)
+                    _update_project_record(folder)
+                failures = sum(item["status"] != "completed" for item in outcomes)
+                return self._json(200, {"execution_id": execution_id,
+                                        "status": "completed" if not failures else "partial",
+                                        "calls": outcomes,
+                                        "policy": "Only registered read-only tools can execute. No provider, autonomous planner, circuit mutation, or electrical-value inference is enabled."})
+            except RequestTooLarge as exc:
+                return self._json(413, {"error": str(exc)})
+            except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+                return self._json(400, {"error": str(exc)})
+            except OSError as exc:
+                return self._json(500, {"error": f"Agent action log could not be stored: {exc}"})
+        if path == "/api/projects/import":
+            if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/zip":
+                return self._json(415, {"error": "Project backup upload must use Content-Type application/zip"})
+            temporary = None
+            try:
+                raw = self._read_raw_body(MAX_ARCHIVE_BYTES)
+                source_id, source_project, files = read_project_archive(raw)
+                project_id = uuid.uuid4().hex[:12]
+                created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                project = dict(source_project)
+                project.update({"project_id": project_id, "imported_from_project_id": source_id,
+                                "imported_at": created_at})
+                projects_dir = DATA_DIR / "projects"
+                projects_dir.mkdir(parents=True, exist_ok=True)
+                temporary = Path(tempfile.mkdtemp(prefix=".project-import-", dir=DATA_DIR))
+                for relative, contents in files.items():
+                    if relative in {"project.json", "snapshots/manifest.json"}:
+                        continue
+                    destination = temporary.joinpath(*relative.split("/"))
+                    _atomic_bytes(destination, contents)
+                manifest = files.get("snapshots/manifest.json")
+                if manifest is not None:
+                    snapshot_manifest = json.loads(manifest.decode("utf-8"))
+                    snapshot_manifest["project_id"] = project_id
+                    _atomic_bytes(temporary / "snapshots" / "manifest.json",
+                                  (json.dumps(snapshot_manifest, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8"))
+                _atomic_bytes(temporary / "project.json",
+                              (json.dumps(project, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8"))
+                _update_project_record(temporary)
+                target = projects_dir / project_id
+                with _CIRCUIT_API_LOCK:
+                    if target.exists():
+                        raise OSError("Generated project ID already exists; retry the import")
+                    os.replace(temporary, target)
+                    temporary = None
+                imported_project = json.loads((target / "project.json").read_text("utf-8"))
+                return self._json(201, {"project": imported_project, "source_project_id": source_id,
+                                         "imported_at": created_at,
+                                         "artifact_count": len(imported_project.get("artifacts", [])),
+                                         "scope": "Project archive was imported as a new project ID. Circuit topology was validated; no electrical or artifact-specific validation was performed."})
+            except RequestTooLarge as exc:
+                return self._json(413, {"error": str(exc)})
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+                return self._json(422, {"error": str(exc)})
+            except OSError as exc:
+                return self._json(500, {"error": f"Project archive could not be imported: {exc}"})
+            finally:
+                if temporary is not None:
+                    shutil.rmtree(temporary, ignore_errors=True)
         if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["designs", "rc-low-pass"]:
             project_id = parts[2]
             if not _valid_id(project_id):
@@ -352,6 +1115,70 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(422, {"error": str(exc)})
             except OSError as exc:
                 return self._json(500, {"error": f"RC low-pass synthesis report could not be stored: {exc}"})
+        if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["firmware", "scaffold"]:
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            try:
+                payload = self._read_payload(100_000)
+                with _project_tool_lock(project_id), _CIRCUIT_API_LOCK:
+                    project = json.loads((folder / "project.json").read_text("utf-8"))
+                    if project.get("architecture") != "esp32":
+                        raise ValueError("Firmware scaffolding is only applicable to projects explicitly declared with architecture 'esp32'")
+                    model = load_circuit(folder)
+                    topology = validate_model(model)
+                    if not topology["topology_valid"]:
+                        return self._json(409, {"error": "Saved circuit model failed schema/topology checks", "topology_report": topology})
+                    generated = generate_esp32_scaffold(payload, model)
+                    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+                    model_hash = hashlib.sha256(json.dumps(model, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+                    request_hash = generated["manifest"]["configuration_sha256"]
+                    manifest_name = f"firmware_scaffold_{run_id}.json"
+                    source_name = f"firmware_main_{run_id}.cpp"
+                    config_name = f"platformio_{run_id}.ini"
+                    archive_name = f"firmware_project_{run_id}.zip"
+                    manifest = {**generated["manifest"], "run_id": run_id, "artifact_names": {
+                        "manifest": manifest_name, "source": source_name, "platformio_config": config_name,
+                        "project_zip": archive_name}}
+                    manifest_bytes = (json.dumps(manifest, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+                    _atomic_bytes(folder / manifest_name, manifest_bytes)
+                    _atomic_bytes(folder / source_name, generated["files"]["src/main.cpp"])
+                    _atomic_bytes(folder / config_name, generated["files"]["platformio.ini"])
+                    _atomic_bytes(folder / archive_name, generated["files"]["firmware_project.zip"])
+                    created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    report = {"run_id": run_id, "kind": "esp32_firmware_scaffold", "created_at": created_at,
+                              "status": "scaffold-generated-uncompiled", "request_sha256": request_hash,
+                              "circuit_model_sha256": model_hash,
+                              "generated_sha256": {"manifest": hashlib.sha256(manifest_bytes).hexdigest(),
+                                                   "source": generated["sha256"]["src/main.cpp"],
+                                                   "platformio_config": generated["sha256"]["platformio.ini"],
+                                                   "project_zip": generated["sha256"]["firmware_project.zip"]},
+                              "target": generated["manifest"]["target"],
+                              "pin_mappings": generated["manifest"]["pin_mappings"],
+                              "warnings": generated["manifest"]["limitations"],
+                              "artifacts": {"manifest": manifest_name, "source": source_name,
+                                            "platformio_config": config_name, "project_zip": archive_name}}
+                    with (folder / "firmware_runs.jsonl").open("a", encoding="utf-8") as log:
+                        log.write(json.dumps(report, ensure_ascii=False, allow_nan=False) + "\n")
+                        log.flush()
+                        os.fsync(log.fileno())
+                    validation_path = folder / "validation_report.json"
+                    validation = json.loads(validation_path.read_text("utf-8")) if validation_path.exists() else {"checks": {}, "findings": []}
+                    checks = validation.setdefault("checks", {})
+                    checks["firmware_scaffold"] = "generated from explicit GPIO-to-net mapping"
+                    checks["firmware_compile"] = "not-run (scaffold generated; no compiler invoked)"
+                    _atomic_bytes(validation_path, (json.dumps(validation, indent=2, ensure_ascii=False) + "\n").encode())
+                    _update_project_record(folder, validation)
+                return self._json(201, report)
+            except RequestTooLarge as exc:
+                return self._json(413, {"error": str(exc)})
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+                return self._json(422, {"error": str(exc)})
+            except OSError as exc:
+                return self._json(500, {"error": f"Firmware scaffold could not be stored: {exc}"})
         if len(parts) == 6 and parts[:2] == ["api", "projects"] and parts[3] == "simulations" and parts[4] in {"transient-rc", "transient-rlc"} and parts[5] == "from-model":
             is_rlc = parts[4] == "transient-rlc"
             project_id = parts[2]
@@ -465,6 +1292,68 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(422, {"error": str(exc)})
             except OSError as exc:
                 return self._json(500, {"error": f"Graph-bound MNA report could not be stored: {exc}"})
+        if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3] == "simulations" and parts[4] in {"operating-limits", "transient-limits"}:
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            try:
+                payload = self._read_payload(200_000)
+                if set(payload) != {"simulation_artifact", "limits"} or not isinstance(payload.get("simulation_artifact"), str):
+                    raise ValueError("Request must contain exactly simulation_artifact and limits")
+                source_name = payload["simulation_artifact"]
+                if source_name not in _allowed_artifacts(project_id) or not source_name.startswith("simulation_") or not source_name.endswith(".json"):
+                    raise ValueError("simulation_artifact must name an existing saved simulation JSON report")
+                with _project_tool_lock(project_id), _CIRCUIT_API_LOCK:
+                    source_path = folder / source_name
+                    source_bytes = source_path.read_bytes()
+                    source_report = json.loads(source_bytes.decode("utf-8"))
+                    dc_kinds = {"circuit_graph_bound_linear_dc_mna_operating_point",
+                                "circuit_graph_bound_piecewise_linear_diode_dc_operating_point",
+                                "circuit_graph_bound_shockley_diode_dc_operating_point"}
+                    transient_kinds = {"circuit_graph_bound_linear_rc_transient", "circuit_graph_bound_linear_rlc_transient"}
+                    source_kind = source_report.get("kind")
+                    if source_kind not in dc_kinds | transient_kinds:
+                        raise ValueError("Limit checks require a saved graph-bound DC operating point or RC/RLC transient report")
+                    transient_endpoint = parts[4] == "transient-limits"
+                    if transient_endpoint != (source_kind in transient_kinds):
+                        raise ValueError("Select the operating-limits endpoint for DC reports or transient-limits for RC/RLC reports")
+                    calculation = source_report.get("calculation")
+                    outputs = calculation.get("outputs") if isinstance(calculation, dict) else None
+                    if not isinstance(outputs, dict):
+                        raise ValueError("Selected simulation report has no usable output data")
+                    assessment = (assess_operating_limits(outputs.get("elements"), payload["limits"])
+                                  if source_kind in dc_kinds else assess_transient_reactive_limits(outputs, payload["limits"]))
+                    model = load_circuit(folder)
+                    current_hash = hashlib.sha256(json.dumps(model, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+                    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+                    report = {"run_id": run_id, "kind": "simulation_operating_limit_check",
+                              "simulation_kind": source_kind,
+                              "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                              "status": assessment["status"], "assessment": assessment,
+                              "simulation_artifact": source_name,
+                              "simulation_report_sha256": hashlib.sha256(source_bytes).hexdigest(),
+                              "simulation_circuit_model_sha256": source_report.get("circuit_model_sha256"),
+                              "current_circuit_model_sha256": current_hash,
+                              "model_status": "same-as-simulation-model" if source_report.get("circuit_model_sha256") == current_hash else "saved-model-changed-since-simulation",
+                              "component_coverage": source_report.get("component_coverage"),
+                              "limits": payload["limits"],
+                              "warnings": ["All limits are caller-supplied and unverified; no ratings are inferred from part labels, inventory, or datasheets.",
+                                           "A passing bound check is not component qualification, thermal analysis, electrical safety review, or design approval."]}
+                    if isinstance(report["component_coverage"], dict) and report["component_coverage"].get("has_exclusions"):
+                        report["warnings"].append("The source simulation excluded components; comparisons cover only elements present in that partial model.")
+                    report["artifact"] = f"operating_limit_check_{run_id}.json"
+                    _atomic_bytes(folder / report["artifact"], (json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8"))
+                    _update_project_record(folder)
+                return self._json(201, report)
+            except RequestTooLarge as exc:
+                return self._json(413, {"error": str(exc)})
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+                return self._json(422, {"error": str(exc)})
+            except OSError as exc:
+                return self._json(500, {"error": f"Operating-limit report could not be stored: {exc}"})
         if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["simulations", "dc-sweep"]:
             project_id = parts[2]
             if not _valid_id(project_id):
@@ -676,6 +1565,58 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(422, {"error": str(exc)})
             except OSError as exc:
                 return self._json(500, {"error": f"AC sweep report could not be stored: {exc}"})
+        if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3] == "simulations" and parts[4] in {"digital-truth-table", "digital-waveform"}:
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            try:
+                payload = self._read_payload(16_000_000 if parts[4] == "digital-waveform" else 100_000)
+                if set(payload) != {"netlist"} or not isinstance(payload.get("netlist"), dict):
+                    raise ValueError("Request must contain exactly one 'netlist' object")
+                normalized_netlist = json.loads(json.dumps(payload["netlist"], sort_keys=True, separators=(",", ":"),
+                                                            ensure_ascii=False, allow_nan=False))
+                is_waveform = parts[4] == "digital-waveform"
+                calculation = (simulate_digital_waveform if is_waveform else simulate_digital_truth_table)(normalized_netlist)
+                netlist_hash = hashlib.sha256(json.dumps(normalized_netlist, sort_keys=True, separators=(",", ":"),
+                                                         ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+                with _project_tool_lock(project_id), _CIRCUIT_API_LOCK:
+                    model = load_circuit(folder)
+                    topology = validate_model(model)
+                    if not topology["topology_valid"]:
+                        return self._json(409, {"error": "Saved circuit model is invalid; digital report is not attached to an invalid revision", "topology_report": topology})
+                    model_hash = hashlib.sha256(json.dumps(model, sort_keys=True, separators=(",", ":"),
+                                                           ensure_ascii=False).encode("utf-8")).hexdigest()
+                    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+                    report_kind = "digital_waveform" if is_waveform else "digital_truth_table"
+                    report_name = f"simulation_digital_{'waveform_' if is_waveform else ''}{run_id}.json"
+                    created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    report = {"run_id": run_id, "kind": report_kind, "created_at": created_at,
+                              "status": "completed", "circuit_model_sha256": model_hash,
+                              "netlist_sha256": netlist_hash,
+                              "model_association": "user-associated saved-model revision; Boolean netlist was not generated from or matched to the circuit graph",
+                              "calculation": calculation, "input_netlist": normalized_netlist,
+                              "artifact": report_name}
+                    _atomic_bytes(folder / report_name, (json.dumps(report, indent=2, ensure_ascii=False,
+                                                                     allow_nan=False) + "\n").encode())
+                    with (folder / "simulation_runs.jsonl").open("a", encoding="utf-8") as log:
+                        log.write(json.dumps({"run_id": run_id, "kind": report["kind"], "created_at": created_at,
+                                              "circuit_model_sha256": model_hash, "netlist_sha256": netlist_hash,
+                                              "artifact": report_name}, ensure_ascii=False, allow_nan=False) + "\n")
+                        log.flush()
+                        os.fsync(log.fileno())
+                    _update_project_record(folder)
+                return self._json(201, report)
+            except CppEngineUnavailable as exc:
+                return self._json(503, {"error": str(exc)})
+            except RequestTooLarge as exc:
+                return self._json(413, {"error": str(exc)})
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+                return self._json(422, {"error": str(exc)})
+            except OSError as exc:
+                return self._json(500, {"error": f"Digital simulation report could not be stored: {exc}"})
         if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["simulations", "dc-operating-point"]:
             project_id = parts[2]
             if not _valid_id(project_id):
@@ -968,6 +1909,48 @@ class Handler(BaseHTTPRequestHandler):
                 _atomic_bytes(validation_path, (json.dumps(validation, indent=2, ensure_ascii=False) + "\n").encode())
                 _update_project_record(folder, validation)
             return self._json(200, result)
+        if len(parts) == 5 and parts[:2] == ["api", "projects"] and parts[3:] == ["circuit", "connectivity-schedule"]:
+            project_id = parts[2]
+            if not _valid_id(project_id):
+                return self._json(400, {"error": "Invalid project id"})
+            folder = DATA_DIR / "projects" / project_id
+            if not folder.is_dir():
+                return self._json(404, {"error": "Project not found"})
+            try:
+                payload = self._read_payload(2_000)
+                if payload != {}:
+                    raise ValueError("Connectivity schedule request body must be an empty JSON object")
+                with _project_tool_lock(project_id), _CIRCUIT_API_LOCK:
+                    model = load_circuit(folder)
+                    topology = validate_model(model)
+                    if not topology["topology_valid"]:
+                        return self._json(409, {"error": "Saved circuit model failed schema/topology checks; no schedule was generated", "topology_report": topology})
+                    model_hash = hashlib.sha256(json.dumps(model, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+                    report = build_connectivity_schedule(model, model_hash)
+                    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+                    created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    csv_buffer = io.StringIO(newline="")
+                    writer = csv.DictWriter(csv_buffer, fieldnames=["net", "reference", "pin", "pin_name", "pin_type"])
+                    writer.writeheader()
+                    for net in report["nets"]:
+                        for endpoint in net["endpoints"]:
+                            writer.writerow({"net": net["name"], **endpoint})
+                    csv_text = csv_buffer.getvalue()
+                    csv_artifact = f"connectivity_schedule_{run_id}.csv"
+                    report.update({"run_id": run_id, "created_at": created_at,
+                                   "artifact": f"connectivity_schedule_{run_id}.json",
+                                   "csv_artifact": csv_artifact,
+                                   "csv_sha256": hashlib.sha256(csv_text.encode("utf-8")).hexdigest()})
+                    _atomic_bytes(folder / report["artifact"], (json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8"))
+                    _atomic_bytes(folder / csv_artifact, csv_text.encode("utf-8"))
+                    _update_project_record(folder)
+                return self._json(201, report)
+            except RequestTooLarge as exc:
+                return self._json(413, {"error": str(exc)})
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+                return self._json(422, {"error": str(exc)})
+            except OSError as exc:
+                return self._json(500, {"error": f"Connectivity schedule could not be stored: {exc}"})
         if len(parts) == 6 and parts[:2] == ["api", "projects"] and parts[3:] == ["circuit", "symbols", "resolve"]:
             project_id = parts[2]
             if not _valid_id(project_id):
@@ -1334,6 +2317,121 @@ def _update_project_record(folder: Path, validation: dict[str, object] | None = 
     artifacts = {path.name for path in folder.iterdir() if path.is_file() and path.name != "project.json"}
     record["artifacts"] = sorted(artifacts)
     _atomic_bytes(project_path, (json.dumps(record, indent=2, ensure_ascii=False) + "\n").encode())
+
+
+def _load_verified_agent_execution(folder: Path, project_id: str, execution_id: str) -> tuple[dict[str, object], str, dict[str, object]]:
+    """Load one bounded, digest-checked execution artifact with an intact audit-chain link."""
+    if not _valid_agent_plan_id(execution_id):
+        raise ValueError("Invalid execution id")
+    path = folder / f"agent_execution_{execution_id}.json"
+    if not path.is_file():
+        raise FileNotFoundError("Agent execution report not found")
+    if path.stat().st_size > MAX_AGENT_REPORT_BYTES:
+        raise ValueError("Execution report exceeds the verification size limit")
+    raw = path.read_bytes()
+    report = json.loads(raw.decode("utf-8"))
+    if (not isinstance(report, dict) or report.get("execution_id") != execution_id or
+            report.get("project_id") != project_id or report.get("artifact") != path.name):
+        raise ValueError("Execution report identity check failed")
+    try:
+        digest = execution_report_digest(report)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Execution report content could not be hashed") from exc
+    if digest != report.get("execution_report_sha256"):
+        raise ValueError("Execution report content digest does not match")
+    action_path = folder / "agent_actions.jsonl"
+    rows, chain = verify_agent_actions(action_path.read_text("utf-8") if action_path.is_file() else "")
+    if chain.get("status") != "intact":
+        raise ValueError("Agent audit chain is not intact")
+    report_hash = hashlib.sha256(raw).hexdigest()
+    linked = any(row.get("tool") == "agent.plan.execute" and
+                 row.get("execution_id") == execution_id and
+                 row.get("result_sha256") == report_hash for row in rows)
+    if not linked:
+        raise ValueError("Execution report has no matching audit-chain record")
+    return report, report_hash, chain
+
+
+def _valid_agent_plan_id(plan_id: str) -> bool:
+    return len(plan_id) == 32 and all(char in "0123456789abcdef" for char in plan_id)
+
+
+def _read_agent_plan(folder: Path, project_id: str, plan_id: str) -> dict[str, object]:
+    if not _valid_agent_plan_id(plan_id):
+        raise ValueError("Invalid plan id")
+    path = folder / f"agent_plan_{plan_id}.json"
+    if not path.is_file():
+        raise FileNotFoundError("Agent plan not found")
+    plan = json.loads(path.read_text("utf-8"))
+    if (not isinstance(plan, dict) or plan.get("plan_id") != plan_id or
+            plan.get("project_id") != project_id or
+            not isinstance(plan.get("summary"), str) or not isinstance(plan.get("calls"), list) or
+            plan.get("artifact") != path.name):
+        raise ValueError("Agent plan record is malformed or belongs to another project")
+    digest = plan.get("plan_sha256")
+    if not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        raise ValueError("Agent plan hash metadata is malformed")
+    try:
+        calculated = agent_plan_digest(plan)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Agent plan content could not be hashed") from exc
+    if calculated != digest:
+        raise ValueError("Agent plan content hash does not match its reviewed hash")
+    return plan
+
+
+def _valid_agent_proposal_id(proposal_id: str) -> bool:
+    return len(proposal_id) == 32 and all(char in "0123456789abcdef" for char in proposal_id)
+
+
+def _read_agent_proposal(folder: Path, proposal_id: str) -> dict[str, object]:
+    if not _valid_agent_proposal_id(proposal_id):
+        raise ValueError("Invalid proposal id")
+    path = folder / f"agent_proposal_{proposal_id}.json"
+    if not path.is_file():
+        raise FileNotFoundError("Agent proposal not found")
+    proposal = json.loads(path.read_text("utf-8"))
+    if (not isinstance(proposal, dict) or proposal.get("proposal_id") != proposal_id or
+            not isinstance(proposal.get("project_id"), str) or not _valid_id(proposal["project_id"]) or
+            proposal.get("tool") != "circuit.replace_model" or
+            not isinstance(proposal.get("status"), str) or
+            proposal["status"] not in {"awaiting-approval", "approved-and-applied", "expired", "stale"} or
+            not isinstance(proposal.get("model"), dict)):
+        raise ValueError("Agent proposal record is malformed")
+    for key in ("base_model_sha256", "candidate_model_sha256"):
+        digest = proposal.get(key)
+        if not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise ValueError("Agent proposal hash metadata is malformed")
+    try:
+        expiry = datetime.fromisoformat(proposal["expires_at"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Agent proposal expiry metadata is malformed") from exc
+    if expiry.tzinfo is None:
+        raise ValueError("Agent proposal expiry must include a timezone")
+    return proposal
+
+
+def _agent_proposal_summary(proposal: dict[str, object]) -> dict[str, object]:
+    keys = ("proposal_id", "project_id", "tool", "status", "created_at", "expires_at",
+            "base_model_sha256", "candidate_model_sha256", "approved_at", "applied_model_sha256")
+    return {key: proposal[key] for key in keys if key in proposal}
+
+
+def _agent_audit_row(tool: str, status: str, input_hash: str, result_hash: str,
+                     permission: str = "write-circuit") -> dict[str, object]:
+    return {"execution_id": uuid.uuid4().hex, "call_id": uuid.uuid4().hex,
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "tool": tool, "permission": permission, "requires_approval": permission != "read-only",
+            "status": status, "arguments_sha256": input_hash,
+            "result_sha256": result_hash, "duration_ms": 0.0}
+
+
+def _append_agent_actions(folder: Path, rows: list[dict[str, object]]) -> None:
+    """Append bounded, hash-linked action records atomically."""
+    path = folder / "agent_actions.jsonl"
+    prior = path.read_text("utf-8") if path.is_file() else ""
+    encoded, _ = append_agent_actions(prior, rows)
+    _atomic_bytes(path, encoded.encode("utf-8"))
 
 
 def _atomic_bytes(path: Path, data: bytes) -> None:

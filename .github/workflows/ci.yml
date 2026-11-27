@@ -1,0 +1,64 @@
+name: Native and Python tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} · Python ${{ matrix.python-version }} · C++20
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ['3.11', '3.12']
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Configure native core
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCIRCUITMIND_BUILD_TESTS=ON
+      - name: Build native core and tests
+        run: cmake --build build --config Release --parallel 2
+      - name: Configure native library path on Linux
+        if: runner.os == 'Linux'
+        run: echo "CIRCUITMIND_ENGINE_LIB=${{ github.workspace }}/build/core/libcircuitmind_core.so" >> "$GITHUB_ENV"
+      - name: Configure native library path on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $library = Get-ChildItem -Path build -Filter circuitmind_core.dll -Recurse | Select-Object -First 1
+          if (-not $library) { throw 'CMake did not produce circuitmind_core.dll' }
+          "CIRCUITMIND_ENGINE_LIB=$($library.FullName)" >> $env:GITHUB_ENV
+      - name: Run CTest
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Run native self-test on Linux
+        if: runner.os == 'Linux'
+        run: ./build/core/circuitmind_engine_cli --self-test
+      - name: Run native self-test on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\build\core\Release\circuitmind_engine_cli.exe --self-test
+      - name: Run Python integration suite
+        run: python -m unittest discover -s tests -v
+      - name: Check Python and JavaScript syntax
+        run: |
+          python -m compileall -q circuitmind tests
+          node --check web/app.js

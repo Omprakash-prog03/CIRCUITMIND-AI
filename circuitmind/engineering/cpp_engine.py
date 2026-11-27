@@ -124,6 +124,44 @@ class _AcSweepResult(ctypes.Structure):
     ]
 
 
+class _DigitalGate(ctypes.Structure):
+    _fields_ = [("kind", ctypes.c_uint32), ("input_a", ctypes.c_uint32),
+                ("input_b", ctypes.c_uint32), ("output", ctypes.c_uint32)]
+
+
+class _DigitalWaveformGate(ctypes.Structure):
+    _fields_ = [("kind", ctypes.c_uint32), ("input_a", ctypes.c_uint32),
+                ("input_b", ctypes.c_uint32), ("output", ctypes.c_uint32),
+                ("initial_value", ctypes.c_uint8), ("active_edge", ctypes.c_uint8)]
+
+
+class _DigitalTruthTableRequest(ctypes.Structure):
+    _fields_ = [("request_version", ctypes.c_uint32), ("net_count", ctypes.c_uint32),
+                ("gate_count", ctypes.c_uint32), ("gates", ctypes.POINTER(_DigitalGate)),
+                ("input_count", ctypes.c_uint32), ("input_nets", ctypes.POINTER(ctypes.c_uint32)),
+                ("output_count", ctypes.c_uint32), ("output_nets", ctypes.POINTER(ctypes.c_uint32))]
+
+
+class _DigitalTruthTableResult(ctypes.Structure):
+    _fields_ = [("output_values", ctypes.POINTER(ctypes.c_uint8)), ("output_capacity", ctypes.c_size_t),
+                ("row_count", ctypes.c_size_t), ("output_count", ctypes.c_size_t)]
+
+
+class _DigitalWaveformRequest(ctypes.Structure):
+    _fields_ = [("request_version", ctypes.c_uint32), ("net_count", ctypes.c_uint32),
+                ("gate_count", ctypes.c_uint32), ("gates", ctypes.POINTER(_DigitalWaveformGate)),
+                ("input_count", ctypes.c_uint32), ("input_nets", ctypes.POINTER(ctypes.c_uint32)),
+                ("output_count", ctypes.c_uint32), ("output_nets", ctypes.POINTER(ctypes.c_uint32)),
+                ("sample_count", ctypes.c_size_t), ("primary_input_samples", ctypes.POINTER(ctypes.c_uint8)),
+                ("sample_interval_s", ctypes.c_double)]
+
+
+class _DigitalWaveformResult(ctypes.Structure):
+    _fields_ = [("sample_times_s", ctypes.POINTER(ctypes.c_double)), ("sample_time_capacity", ctypes.c_size_t),
+                ("output_values", ctypes.POINTER(ctypes.c_uint8)), ("output_capacity", ctypes.c_size_t),
+                ("sample_count", ctypes.c_size_t), ("output_count", ctypes.c_size_t)]
+
+
 class _TransientRequest(ctypes.Structure):
     _fields_ = [
         ("request_version", ctypes.c_uint32),
@@ -197,6 +235,16 @@ def _load_library() -> ctypes.CDLL:
                 ctypes.POINTER(ctypes.c_char), ctypes.c_size_t,
             ]
             library.cm_engine_simulate_ac_sweep_v1.restype = ctypes.c_int
+            library.cm_engine_simulate_digital_truth_table_v1.argtypes = [
+                ctypes.POINTER(_DigitalTruthTableRequest), ctypes.POINTER(_DigitalTruthTableResult),
+                ctypes.POINTER(ctypes.c_char), ctypes.c_size_t,
+            ]
+            library.cm_engine_simulate_digital_truth_table_v1.restype = ctypes.c_int
+            library.cm_engine_simulate_digital_waveform_v1.argtypes = [
+                ctypes.POINTER(_DigitalWaveformRequest), ctypes.POINTER(_DigitalWaveformResult),
+                ctypes.POINTER(ctypes.c_char), ctypes.c_size_t,
+            ]
+            library.cm_engine_simulate_digital_waveform_v1.restype = ctypes.c_int
             return library
         except (OSError, AttributeError) as exc:
             failures.append(f"{candidate}: {exc}")
@@ -906,4 +954,225 @@ def simulate_ac_sweep(netlist: dict[str, Any]) -> dict[str, Any]:
         "element_count": len(elements),
         "input_quantities": input_quantities,
         "scope": "Bounded linear R/C frequency-domain nodal response computed by the native C++ core using sinusoidal RMS phasors.",
+    }
+
+
+def simulate_digital_truth_table(netlist: dict[str, Any]) -> dict[str, Any]:
+    """Marshal an explicit combinational logic netlist through the native C++ core."""
+    if not isinstance(netlist, dict) or set(netlist) != {"inputs", "outputs", "gates"}:
+        raise ValueError("Digital netlist must contain exactly inputs, outputs, and gates")
+    input_names, output_names, gates = netlist["inputs"], netlist["outputs"], netlist["gates"]
+    if not isinstance(input_names, list) or not 1 <= len(input_names) <= 10:
+        raise ValueError("Digital netlist must define between 1 and 10 primary input nets")
+    if not isinstance(output_names, list) or not 1 <= len(output_names) <= 32:
+        raise ValueError("Digital netlist must define between 1 and 32 output nets")
+    if not isinstance(gates, list) or not 1 <= len(gates) <= 512:
+        raise ValueError("Digital netlist must contain between 1 and 512 gates")
+    for label, names in (("input", input_names), ("output", output_names)):
+        if any(not isinstance(name, str) or not _NODE_RE.fullmatch(name) for name in names):
+            raise ValueError(f"Digital {label} net names must be valid simple labels")
+        if len(set(names)) != len(names):
+            raise ValueError(f"Digital {label} net names must be unique")
+
+    gate_codes = {"not": 0, "buffer": 1, "and": 2, "or": 3,
+                  "xor": 4, "nand": 5, "nor": 6, "xnor": 7}
+    unary_kinds = {"not", "buffer"}
+    all_names = list(dict.fromkeys([*input_names, *output_names]))
+    parsed_gates = []
+    for index, gate in enumerate(gates):
+        if not isinstance(gate, dict) or set(gate) != {"type", "inputs", "output"}:
+            raise ValueError(f"gates[{index}] must contain exactly type, inputs, and output")
+        kind = gate["type"]
+        if not isinstance(kind, str) or kind not in gate_codes:
+            raise ValueError(f"gates[{index}] has unsupported logic type {kind!r}")
+        inputs = gate["inputs"]
+        expected_count = 1 if kind in unary_kinds else 2
+        if not isinstance(inputs, list) or len(inputs) != expected_count:
+            raise ValueError(f"gates[{index}] {kind} gate requires exactly {expected_count} input net(s)")
+        output = gate["output"]
+        for net in [*inputs, output]:
+            if not isinstance(net, str) or not _NODE_RE.fullmatch(net):
+                raise ValueError(f"gates[{index}] uses an invalid net label")
+            if net not in all_names:
+                all_names.append(net)
+        parsed_gates.append((kind, inputs, output))
+    if len(all_names) > 256:
+        raise ValueError("Digital netlist exceeds the 256-net limit")
+    net_indices = {name: index for index, name in enumerate(all_names)}
+    native_gate_type = _DigitalGate * len(parsed_gates)
+    native_gates = native_gate_type(*[
+        _DigitalGate(gate_codes[kind], net_indices[inputs[0]],
+                     net_indices[inputs[1]] if len(inputs) == 2 else 0,
+                     net_indices[output])
+        for kind, inputs, output in parsed_gates
+    ])
+    input_array = (ctypes.c_uint32 * len(input_names))(*(net_indices[name] for name in input_names))
+    output_array = (ctypes.c_uint32 * len(output_names))(*(net_indices[name] for name in output_names))
+    request = _DigitalTruthTableRequest(1, len(all_names), len(parsed_gates), native_gates,
+                                        len(input_names), input_array, len(output_names), output_array)
+    row_count = 1 << len(input_names)
+    output_capacity = row_count * len(output_names)
+    output_values = (ctypes.c_uint8 * output_capacity)()
+    output = _DigitalTruthTableResult(output_values, output_capacity, 0, 0)
+    error = ctypes.create_string_buffer(512)
+    library = _load_library()
+    status = library.cm_engine_simulate_digital_truth_table_v1(
+        ctypes.byref(request), ctypes.byref(output), error, len(error))
+    if status != 0:
+        raise ValueError(error.value.decode("utf-8", errors="replace") or f"C++ core returned status {status}")
+    if output.row_count != row_count or output.output_count != len(output_names):
+        raise RuntimeError("C++ core returned an unexpected digital truth-table shape")
+
+    rows = []
+    for row_index in range(row_count):
+        input_bits = {name: (row_index >> (len(input_names) - column - 1)) & 1
+                      for column, name in enumerate(input_names)}
+        outputs = {name: int(output_values[row_index * len(output_names) + column])
+                   for column, name in enumerate(output_names)}
+        rows.append({"inputs": input_bits, "outputs": outputs})
+    version_bytes = library.cm_engine_version()
+    version = version_bytes.decode("ascii") if version_bytes else "unknown"
+    return {
+        "calculation_schema_version": 1,
+        "name": "Combinational digital truth table",
+        "formula": "Explicit Boolean gate network evaluated in topological order for every primary-input combination",
+        "inputs": [{"name": name, "net": name} for name in input_names],
+        "substitution": f"Evaluated {len(rows)} combinations over {len(parsed_gates)} gates in the native C++ core.",
+        "outputs": {"status": "completed-combinational-digital-truth-table",
+                    "solver_engine": "circuitmind-cpp-core", "solver_version": version,
+                    "primary_inputs": input_names, "primary_outputs": output_names,
+                    "gate_count": len(parsed_gates), "net_count": len(all_names),
+                    "row_count": output.row_count, "truth_table": rows},
+        "assumptions": ["Logic levels are ideal Boolean 0/1 values with zero propagation delay.",
+                        "The caller explicitly names all primary inputs, outputs, and gate connections."],
+        "validity": ["Combinational gates only; sequential state, timing, metastability, analog thresholds, and electrical loading are not simulated.",
+                     "Supports NOT, buffer, AND, OR, XOR, NAND, NOR, and XNOR; maximum 10 inputs, 32 outputs, 512 gates, and 256 nets."],
+        "warnings": ["This truth-table calculation does not simulate time, sequential devices, or hardware behavior."],
+        "scope": "CPU-executed native combinational logic truth table; not HDL verification or physical electrical validation.",
+    }
+
+
+def simulate_digital_waveform(netlist: dict[str, Any]) -> dict[str, Any]:
+    """Sample ideal Boolean logic with edge-triggered D flip-flops in the native C++ core."""
+    fields = {"inputs", "outputs", "gates", "samples", "sample_interval_s"}
+    if not isinstance(netlist, dict) or set(netlist) != fields:
+        raise ValueError("Digital waveform netlist must contain exactly inputs, outputs, gates, samples, and sample_interval_s")
+    input_names, output_names, gates = netlist["inputs"], netlist["outputs"], netlist["gates"]
+    samples = netlist["samples"]
+    interval = netlist["sample_interval_s"]
+    if not isinstance(input_names, list) or not 1 <= len(input_names) <= 32:
+        raise ValueError("Digital waveform must define between 1 and 32 primary input nets")
+    if not isinstance(output_names, list) or not 1 <= len(output_names) <= 32:
+        raise ValueError("Digital waveform must define between 1 and 32 outputs")
+    if not isinstance(gates, list) or not 1 <= len(gates) <= 512:
+        raise ValueError("Digital waveform must contain between 1 and 512 gates")
+    if not isinstance(samples, list) or not 1 <= len(samples) <= 10000:
+        raise ValueError("Digital waveform must contain between 1 and 10000 input samples")
+    if isinstance(interval, bool) or not isinstance(interval, (int, float)):
+        raise ValueError("sample_interval_s must be finite and positive")
+    try:
+        interval = float(interval)
+    except OverflowError as exc:
+        raise ValueError("sample_interval_s must be finite and positive") from exc
+    if not math.isfinite(interval) or interval <= 0:
+        raise ValueError("sample_interval_s must be finite and positive")
+    for label, names in (("input", input_names), ("output", output_names)):
+        if any(not isinstance(name, str) or not _NODE_RE.fullmatch(name) for name in names):
+            raise ValueError(f"Digital waveform {label} net names must be valid simple labels")
+        if len(set(names)) != len(names):
+            raise ValueError(f"Digital waveform {label} net names must be unique")
+
+    gate_codes = {"not": 0, "buffer": 1, "and": 2, "or": 3,
+                  "xor": 4, "nand": 5, "nor": 6, "xnor": 7, "dff": 8}
+    unary_kinds = {"not", "buffer"}
+    all_names = list(dict.fromkeys([*input_names, *output_names]))
+    parsed_gates = []
+    for index, gate in enumerate(gates):
+        if not isinstance(gate, dict):
+            raise ValueError(f"gates[{index}] must be an object")
+        kind = gate.get("type")
+        if not isinstance(kind, str) or kind not in gate_codes:
+            raise ValueError(f"gates[{index}] has unsupported logic type {kind!r}")
+        base_fields = {"type", "inputs", "output"}
+        required_fields = base_fields | {"initial_value"} if kind == "dff" else base_fields
+        allowed_fields = required_fields | ({"edge"} if kind == "dff" else set())
+        if not required_fields <= set(gate) or not set(gate) <= allowed_fields:
+            raise ValueError(f"gates[{index}] fields do not match the {kind} gate schema")
+        inputs = gate["inputs"]
+        expected_count = 1 if kind in unary_kinds else 2
+        if not isinstance(inputs, list) or len(inputs) != expected_count:
+            raise ValueError(f"gates[{index}] {kind} gate requires exactly {expected_count} input net(s)")
+        initial = gate.get("initial_value", 0)
+        if type(initial) is not int or initial not in (0, 1):
+            raise ValueError(f"gates[{index}] initial_value must be integer 0 or 1")
+        edge_name = gate.get("edge", "rising")
+        if kind != "dff":
+            edge_name = "rising"
+        if edge_name not in ("rising", "falling"):
+            raise ValueError(f"gates[{index}] edge must be 'rising' or 'falling'")
+        edge_code = 1 if edge_name == "falling" else 0
+        output = gate["output"]
+        for net in [*inputs, output]:
+            if not isinstance(net, str) or not _NODE_RE.fullmatch(net):
+                raise ValueError(f"gates[{index}] uses an invalid net label")
+            if net not in all_names:
+                all_names.append(net)
+        parsed_gates.append((kind, inputs, output, initial, edge_code))
+    if len(all_names) > 256:
+        raise ValueError("Digital waveform exceeds the 256-net limit")
+    for row_index, row in enumerate(samples):
+        if not isinstance(row, dict) or set(row) != set(input_names):
+            raise ValueError(f"samples[{row_index}] must provide exactly all primary input values")
+        if any(type(row[name]) is not int or row[name] not in (0, 1) for name in input_names):
+            raise ValueError(f"samples[{row_index}] input values must be integer 0 or 1")
+
+    net_indices = {name: index for index, name in enumerate(all_names)}
+    native_gates = (_DigitalWaveformGate * len(parsed_gates))(*[
+        _DigitalWaveformGate(gate_codes[kind], net_indices[inputs[0]],
+                             net_indices[inputs[1]] if len(inputs) == 2 else 0,
+                             net_indices[output], initial, edge_code)
+        for kind, inputs, output, initial, edge_code in parsed_gates
+    ])
+    input_array = (ctypes.c_uint32 * len(input_names))(*(net_indices[name] for name in input_names))
+    output_array = (ctypes.c_uint32 * len(output_names))(*(net_indices[name] for name in output_names))
+    flattened_samples = [row[name] for row in samples for name in input_names]
+    sample_array = (ctypes.c_uint8 * len(flattened_samples))(*flattened_samples)
+    request = _DigitalWaveformRequest(1, len(all_names), len(parsed_gates), native_gates,
+                                      len(input_names), input_array, len(output_names), output_array,
+                                      len(samples), sample_array, float(interval))
+    times = (ctypes.c_double * len(samples))()
+    values = (ctypes.c_uint8 * (len(samples) * len(output_names)))()
+    output = _DigitalWaveformResult(times, len(samples), values, len(values), 0, 0)
+    error = ctypes.create_string_buffer(512)
+    library = _load_library()
+    status = library.cm_engine_simulate_digital_waveform_v1(
+        ctypes.byref(request), ctypes.byref(output), error, len(error))
+    if status != 0:
+        raise ValueError(error.value.decode("utf-8", errors="replace") or f"C++ core returned status {status}")
+    if output.sample_count != len(samples) or output.output_count != len(output_names):
+        raise RuntimeError("C++ core returned an unexpected digital waveform shape")
+    frames = []
+    for sample_index, row in enumerate(samples):
+        frame_outputs = {name: int(values[sample_index * len(output_names) + column])
+                         for column, name in enumerate(output_names)}
+        frames.append({"time_s": times[sample_index], "inputs": row, "outputs": frame_outputs})
+    version_bytes = library.cm_engine_version()
+    version = version_bytes.decode("ascii") if version_bytes else "unknown"
+    return {
+        "calculation_schema_version": 1,
+        "name": "Sampled digital waveform",
+        "formula": "Ideal Boolean combinational evaluation and configured-edge D flip-flop capture at each ordered sample",
+        "inputs": [{"name": name, "net": name} for name in input_names],
+        "substitution": f"Evaluated {len(samples)} samples over {len(parsed_gates)} gates in the native C++ core.",
+        "outputs": {"status": "completed-sampled-digital-waveform", "solver_engine": "circuitmind-cpp-core",
+                    "solver_version": version, "primary_inputs": input_names, "primary_outputs": output_names,
+                    "gate_count": len(parsed_gates), "net_count": len(all_names),
+                    "sample_interval_s": float(interval), "waveform": frames},
+        "assumptions": ["Samples are ordered uniformly in time; each sample is treated as one observation instant.",
+                        "D flip-flops capture D on the configured sampled rising or falling clock edge and expose Q after that edge; rising is the default.",
+                        "Each clock's prior value is initialized to 0 before the first sample."],
+        "validity": ["Ideal binary logic only; no propagation delay, metastability, setup/hold analysis, analog thresholds, or electrical loading.",
+                     "Maximum 32 primary inputs, 32 outputs, 512 gates, 256 nets, and 10000 samples."],
+        "warnings": ["This sampled Boolean model is not HDL timing verification, a hardware measurement, or analog/digital co-simulation."],
+        "scope": "CPU-executed native sampled digital simulation; no physical or electrical validation is implied.",
     }

@@ -1,3 +1,5 @@
+import hashlib
+import io
 import json
 import math
 import os
@@ -6,7 +8,8 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
-from http.server import ThreadingHTTPServer
+import zipfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
@@ -208,6 +211,94 @@ class CircuitApiTests(unittest.TestCase):
         self.assertIn("none was inferred", audit["components"][0]["reason"])
         self.assertEqual(audit["unresolved_count"], 1)
 
+    def test_native_digital_truth_table_is_persisted_with_bounded_history(self):
+        _, created = self.call("/api/projects", {"name": "Digital truth table", "description": "Boolean gate check", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        netlist = {"inputs": ["A", "B"], "outputs": ["Y"], "gates": [
+            {"type": "xor", "inputs": ["A", "B"], "output": "Y"}]}
+        code, report = self.call(f"/api/projects/{project_id}/simulations/digital-truth-table",
+                                 {"netlist": netlist}, "POST")
+        self.assertEqual(code, 201)
+        self.assertEqual(report["kind"], "digital_truth_table")
+        self.assertEqual([row["outputs"]["Y"] for row in report["calculation"]["outputs"]["truth_table"]], [0, 1, 1, 0])
+        history_code, history = self.call(f"/api/projects/{project_id}/simulations")
+        self.assertEqual(history_code, 200)
+        summary = history["simulations"][-1]
+        self.assertEqual(summary["kind"], "digital_truth_table")
+        self.assertEqual(summary["outputs"]["row_count"], 4)
+        self.assertEqual(summary["netlist_status"], "intact")
+
+    def test_native_digital_waveform_is_persisted_and_summarized_in_history(self):
+        _, created = self.call("/api/projects", {"name": "Digital waveform", "description": "Sampled DFF simulation", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        netlist = {"inputs": ["CLK"], "outputs": ["Q0", "Q1"],
+                   "gates": [
+                       {"type": "dff", "inputs": ["D0", "CLK"], "output": "Q0", "initial_value": 0},
+                       {"type": "dff", "inputs": ["D1", "CLK"], "output": "Q1", "initial_value": 0},
+                       {"type": "not", "inputs": ["Q0"], "output": "D0"},
+                       {"type": "xor", "inputs": ["Q1", "Q0"], "output": "D1"}],
+                   "samples": [{"CLK": level} for level in [0, 1, 0, 1, 0, 1, 0, 1]],
+                   "sample_interval_s": 0.5}
+        code, report = self.call(f"/api/projects/{project_id}/simulations/digital-waveform",
+                                 {"netlist": netlist}, "POST")
+        self.assertEqual(code, 201)
+        self.assertEqual(report["kind"], "digital_waveform")
+        counter_states = [(frame["outputs"]["Q1"], frame["outputs"]["Q0"])
+                          for frame in report["calculation"]["outputs"]["waveform"]]
+        self.assertEqual(counter_states, [(0, 0), (0, 1), (0, 1), (1, 0),
+                                           (1, 0), (1, 1), (1, 1), (0, 0)])
+        self.assertTrue((app_server.DATA_DIR / "projects" / project_id / report["artifact"]).is_file())
+        history_code, history = self.call(f"/api/projects/{project_id}/simulations")
+        self.assertEqual(history_code, 200)
+        summary = history["simulations"][-1]
+        self.assertEqual(summary["kind"], "digital_waveform")
+        self.assertEqual(summary["outputs"]["sample_count"], 8)
+        self.assertEqual(summary["outputs"]["final_outputs"], {"Q0": 0, "Q1": 0})
+        self.assertEqual(summary["netlist_status"], "intact")
+
+    def test_esp32_firmware_scaffold_is_explicit_hash_linked_and_uncompiled(self):
+        _, created = self.call("/api/projects", {"name": "ESP32 scaffold", "description": "Explicit GPIO scaffold", "inventory": "ESP32 Dev Module", "architecture": "esp32"}, "POST")
+        project_id = created["project_id"]
+        model = self.mna_design()
+        self.assertEqual(self.call(f"/api/projects/{project_id}/circuit", {"model": model}, "PUT")[0], 200)
+        request = {"target": "esp32dev", "pins": [
+            {"signal": "display_data", "gpio": 23, "direction": "output", "net": "MID"},
+            {"signal": "set_button", "gpio": 34, "direction": "input", "net": "VIN"},
+        ]}
+        code, report = self.call(f"/api/projects/{project_id}/firmware/scaffold", request, "POST")
+        self.assertEqual(code, 201)
+        self.assertEqual(report["status"], "scaffold-generated-uncompiled")
+        self.assertEqual(report["target"], "esp32dev")
+        source_code, source = self.call(f"/api/projects/{project_id}/artifact/{report['artifacts']['source']}")
+        self.assertEqual(source_code, 200)
+        self.assertIn("GPIO_DISPLAY_DATA = 23", source["content"])
+        zip_code, archive_bytes = self.call(f"/api/projects/{project_id}/artifact/{report['artifacts']['project_zip']}")
+        self.assertEqual(zip_code, 200)
+        self.assertEqual(hashlib.sha256(archive_bytes).hexdigest(), report["generated_sha256"]["project_zip"])
+        with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+            self.assertEqual(set(archive.namelist()), {"firmware_manifest.json", "platformio.ini", "src/main.cpp"})
+            self.assertIn("GPIO_DISPLAY_DATA = 23", archive.read("src/main.cpp").decode())
+        manifest_code, manifest = self.call(f"/api/projects/{project_id}/artifact/{report['artifacts']['manifest']}")
+        self.assertEqual(manifest_code, 200)
+        self.assertEqual(json.loads(manifest["content"])["compile_status"], "not-run")
+        _, validation = self.call(f"/api/projects/{project_id}/artifact/validation_report.json")
+        checks = json.loads(validation["content"])["checks"]
+        self.assertEqual(checks["firmware_scaffold"], "generated from explicit GPIO-to-net mapping")
+        self.assertIn("no compiler invoked", checks["firmware_compile"])
+        invalid = {**request, "pins": [{**request["pins"][0], "gpio": 34}]}
+        code, error = self.call(f"/api/projects/{project_id}/firmware/scaffold", invalid, "POST")
+        self.assertEqual(code, 422)
+        self.assertIn("input-only", error["error"])
+
+    def test_discrete_architecture_cannot_generate_mcu_firmware(self):
+        _, created = self.call("/api/projects", {"name": "Discrete project", "description": "No firmware", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        request = {"target": "esp32dev", "pins": [
+            {"signal": "output", "gpio": 23, "direction": "output", "net": "ANY"}]}
+        code, error = self.call(f"/api/projects/{project_id}/firmware/scaffold", request, "POST")
+        self.assertEqual(code, 422)
+        self.assertIn("architecture 'esp32'", error["error"])
+
     def test_rc_lowpass_synthesis_generates_candidate_without_mutating_graph_by_default(self):
         _, created = self.call("/api/projects", {"name": "Synthesized RC", "description": "Explicit 1 kHz low-pass requirement", "inventory": "", "architecture": "discrete"}, "POST")
         project_id = created["project_id"]
@@ -328,6 +419,13 @@ class CircuitApiTests(unittest.TestCase):
         outputs = report["calculation"]["outputs"]
         self.assertAlmostEqual(outputs["inductor_current_traces_a"]["L1"][-1],
                                sum((1 / 11) * (10 / 11) ** index for index in range(5)), places=11)
+        code, limit_report = self.call(f"/api/projects/{project_id}/simulations/transient-limits", {
+            "simulation_artifact": report["artifact"],
+            "limits": [{"reference": "L1", "max_abs_current": {"value": 0.3, "unit": "A"}}]}, "POST")
+        self.assertEqual(code, 201)
+        self.assertEqual(limit_report["status"], "fail")
+        self.assertEqual(limit_report["assessment"]["evaluations"][0]["metric"], "peak_inductor_current")
+        self.assertEqual(limit_report["assessment"]["evaluations"][0]["peak_time"]["value"], 0.5)
         _, history = self.call(f"/api/projects/{project_id}/simulations")
         self.assertEqual(history["simulations"][-1]["mapping_status"], "intact")
         self.assertEqual(history["simulations"][-1]["outputs"]["final_inductor_currents_a"]["L1"],
@@ -410,6 +508,430 @@ class CircuitApiTests(unittest.TestCase):
         self.assertEqual(code, 201)
         self.assertTrue(partial_report["component_coverage"]["has_exclusions"])
         self.assertTrue(any("partial model" in warning for warning in partial_report["calculation"]["warnings"]))
+
+    def test_component_operating_limits_use_saved_graph_dc_results_and_explicit_bounds(self):
+        _, created = self.call("/api/projects", {"name": "Operating limits", "description": "Explicit stress bounds", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        model = self.mna_design()
+        self.assertEqual(self.call(f"/api/projects/{project_id}/circuit", {"model": model}, "PUT")[0], 200)
+        mapping = {"ground_net": "GND", "bindings": [
+            {"reference": "V1", "type": "voltage_source", "pins": ["1", "2"], "value": {"value": 5, "unit": "V"}},
+            {"reference": "R1", "type": "resistor", "pins": ["1", "2"], "value": {"value": 1, "unit": "kohm"}},
+            {"reference": "R2", "type": "resistor", "pins": ["1", "2"], "value": {"value": 1, "unit": "kohm"}},
+        ], "exclusions": []}
+        code, simulation = self.call(f"/api/projects/{project_id}/simulations/dc-operating-point/from-model", {"mapping": mapping}, "POST")
+        self.assertEqual(code, 201)
+        limits = [{"reference": "R1", "max_abs_voltage": {"value": 2, "unit": "V"},
+                   "max_abs_current": {"value": 3, "unit": "mA"},
+                   "max_abs_power": {"value": 5, "unit": "mW"}}]
+        code, report = self.call(f"/api/projects/{project_id}/simulations/operating-limits",
+                                 {"simulation_artifact": simulation["artifact"], "limits": limits}, "POST")
+        self.assertEqual(code, 201)
+        self.assertEqual(report["status"], "fail")
+        self.assertEqual(report["model_status"], "same-as-simulation-model")
+        self.assertEqual(report["assessment"]["failure_count"], 2)
+        self.assertEqual(report["assessment"]["evaluations"][0]["reference"], "R1")
+        self.assertIn("unverified", report["warnings"][0])
+        self.assertTrue((app_server.DATA_DIR / "projects" / project_id / report["artifact"]).is_file())
+        code, rejected = self.call(f"/api/projects/{project_id}/simulations/operating-limits",
+                                  {"simulation_artifact": "missing.json", "limits": limits}, "POST")
+        self.assertEqual(code, 422)
+
+    def test_connectivity_schedule_is_saved_as_hash_linked_json_and_csv_artifacts(self):
+        _, created = self.call("/api/projects", {"name": "Pin schedule", "description": "Declared graph connections", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        model = self.sample_design()
+        self.assertEqual(self.call(f"/api/projects/{project_id}/circuit", {"model": model}, "PUT")[0], 200)
+        code, report = self.call(f"/api/projects/{project_id}/circuit/connectivity-schedule", {}, "POST")
+        self.assertEqual(code, 201)
+        self.assertEqual(report["component_count"], 2)
+        self.assertEqual(report["net_count"], 2)
+        self.assertEqual(report["endpoint_count"], 4)
+        self.assertEqual(report["unconnected_pin_count"], 0)
+        self.assertEqual(len(report["circuit_model_sha256"]), 64)
+        self.assertEqual(len(report["csv_sha256"]), 64)
+        download = urllib.request.urlopen(self.base + f"/api/projects/{project_id}/artifact/{report['csv_artifact']}")
+        with download:
+            self.assertEqual(download.headers.get_content_type(), "text/csv")
+            self.assertIn("attachment", download.headers.get("Content-Disposition", ""))
+            csv_artifact = download.read()
+        csv_text = csv_artifact.decode("utf-8")
+        self.assertEqual(hashlib.sha256(csv_artifact).hexdigest(), report["csv_sha256"])
+        self.assertIn("net,reference,pin,pin_name,pin_type", csv_text)
+        self.assertIn("A,R1,1", csv_text)
+        code, artifacts = self.call(f"/api/projects/{project_id}/artifacts")
+        self.assertEqual(code, 200)
+        self.assertIn(report["artifact"], artifacts["artifacts"])
+        self.assertIn(report["csv_artifact"], artifacts["artifacts"])
+        self.assertIn("No physical wire routing", report["scope"])
+        code, invalid = self.call(f"/api/projects/{project_id}/circuit/connectivity-schedule", {"unexpected": True}, "POST")
+        self.assertEqual(code, 422)
+
+    def test_agent_plan_route_uses_configured_local_provider_without_sending_project_data(self):
+        observed = {}
+        class LocalPlanHandler(BaseHTTPRequestHandler):
+            def do_POST(inner_self):
+                observed["path"] = inner_self.path
+                observed["authorization"] = inner_self.headers.get("Authorization")
+                observed["body"] = json.loads(inner_self.rfile.read(int(inner_self.headers.get("Content-Length", "0"))))
+                content = json.dumps({"summary": "Validate the saved topology.", "calls": [
+                    {"tool": "circuit.validate", "arguments": {}}]})
+                body = json.dumps({"choices": [{"message": {"content": content}}]}).encode()
+                inner_self.send_response(200); inner_self.send_header("Content-Type", "application/json")
+                inner_self.send_header("Content-Length", str(len(body))); inner_self.end_headers(); inner_self.wfile.write(body)
+            def log_message(self, fmt, *args): pass
+        fake = ThreadingHTTPServer(("127.0.0.1", 0), LocalPlanHandler)
+        fake.daemon_threads = True
+        fake_thread = threading.Thread(target=fake.serve_forever, daemon=True); fake_thread.start()
+        try:
+            _, created = self.call("/api/projects", {"name": "Local plan route", "description": "Not sent to provider", "inventory": "", "architecture": "discrete"}, "POST")
+            project_id = created["project_id"]
+            prompt = "Check if the saved topology is valid."
+            env = {"CIRCUITMIND_AGENT_PROVIDER": "openai-compatible",
+                   "CIRCUITMIND_AGENT_BASE_URL": f"http://127.0.0.1:{fake.server_port}/v1",
+                   "CIRCUITMIND_AGENT_MODEL": "local-fixture", "CIRCUITMIND_AGENT_API_KEY": "fixture-secret"}
+            with patch.dict(os.environ, env):
+                code, plan = self.call(f"/api/projects/{project_id}/agent/plan", {"prompt": prompt}, "POST")
+            self.assertEqual(code, 201)
+            self.assertEqual(plan["provider"], "openai-compatible")
+            self.assertEqual(plan["model"], "local-fixture")
+            self.assertEqual(plan["status"], "awaiting-user-review")
+            self.assertEqual(observed["path"], "/v1/chat/completions")
+            self.assertEqual(observed["authorization"], "Bearer fixture-secret")
+            self.assertEqual(observed["body"]["messages"][1]["content"], prompt)
+            self.assertNotIn("Not sent to provider", json.dumps(observed["body"]))
+            self.assertNotIn("fixture-secret", json.dumps(plan))
+        finally:
+            fake.shutdown(); fake.server_close(); fake_thread.join(timeout=2)
+
+    def test_agent_plan_is_validated_persisted_and_never_auto_executed(self):
+        _, created = self.call("/api/projects", {"name": "Agent planning", "description": "Model plan review", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        model = self.sample_design()
+        self.assertEqual(self.call(f"/api/projects/{project_id}/circuit", {"model": model}, "PUT")[0], 200)
+        prompt = "Review connectivity and verify topology. Do not change the model."
+        model_response = {"provider": "ollama", "model": "fixture", "content": json.dumps({
+            "summary": "Validate topology, then summarize the declared connectivity.",
+            "calls": [{"tool": "circuit.validate", "arguments": {}},
+                      {"tool": "circuit.connectivity_schedule", "arguments": {}}]}),
+            "prompt_sha256": "1" * 64, "completion_sha256": "2" * 64}
+        with patch("circuitmind.server.generate_agent_plan", return_value=model_response) as fake_generate:
+            code, plan = self.call(f"/api/projects/{project_id}/agent/plan", {"prompt": prompt}, "POST")
+        self.assertEqual(code, 201)
+        self.assertEqual(plan["status"], "awaiting-user-review")
+        self.assertIn("no tool has been executed", plan["scope"])
+        self.assertNotIn(prompt, json.dumps(plan))
+        fake_generate.assert_called_once_with(prompt)
+        artifact = app_server.DATA_DIR / "projects" / project_id / plan["artifact"]
+        saved_plan = json.loads(artifact.read_text("utf-8"))
+        self.assertNotIn("prompt", saved_plan)
+        _, actions = self.call(f"/api/projects/{project_id}/agent/actions")
+        self.assertEqual(actions["actions"][-1]["status"], "awaiting-user-review")
+        self.assertEqual(actions["actions"][-1]["permission"], "plan-only")
+        _, unchanged = self.call(f"/api/projects/{project_id}/circuit")
+        self.assertEqual(unchanged["model"], model)
+        code, executed = self.call(plan["execution_url"], {"execute": True}, "POST")
+        self.assertEqual(code, 201)
+        self.assertEqual(executed["report"]["status"], "passed")
+        self.assertTrue(all(check["passed"] for check in executed["report"]["checks"]))
+        self.assertTrue(all(call["status"] == "completed" for call in executed["calls"]))
+        history_code, history = self.call(f"/api/projects/{project_id}/agent/executions")
+        self.assertEqual(history_code, 200)
+        self.assertEqual(history["executions"][0]["execution_id"], executed["report"]["execution_id"])
+        self.assertEqual(history["executions"][0]["integrity"], "verified")
+        report_code, saved_execution = self.call(
+            f"/api/projects/{project_id}/agent/executions/{executed['report']['execution_id']}")
+        self.assertEqual(report_code, 200)
+        self.assertEqual(saved_execution["report"]["execution_report_sha256"], executed["report"]["execution_report_sha256"])
+        code, replay = self.call(plan["execution_url"], {"execute": True}, "POST")
+        self.assertEqual(code, 409)
+        self.assertIn("no longer awaiting review", replay["error"])
+        evidence = executed["report"]["evidence"]
+        evidence_hash = hashlib.sha256(json.dumps(evidence, ensure_ascii=False, sort_keys=True,
+                                                   separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+        generated_summary = {"provider": "ollama", "model": "fixture",
+            "content": json.dumps({"summary": "The saved topology check passed and two nets were declared.",
+                                    "evidence_keys": ["topology.valid", "connectivity.net_count"]}),
+            "evidence_sha256": evidence_hash, "completion_sha256": "7" * 64}
+        execution_path = app_server.DATA_DIR / "projects" / project_id / executed["report"]["artifact"]
+        original_execution_bytes = execution_path.read_bytes()
+        def change_execution_during_summary(_evidence):
+            changed = json.loads(execution_path.read_text("utf-8"))
+            changed["evidence"]["topology"]["valid"] = False
+            execution_path.write_text(json.dumps(changed), encoding="utf-8")
+            return generated_summary
+        with patch("circuitmind.server.generate_evidence_summary", side_effect=change_execution_during_summary):
+            race_code, race_result = self.call(
+                f"/api/projects/{project_id}/agent/executions/{executed['report']['execution_id']}/summarize", {}, "POST")
+        self.assertEqual(race_code, 409)
+        self.assertIn("changed while", race_result["error"])
+        execution_path.write_bytes(original_execution_bytes)
+        with patch("circuitmind.server.generate_evidence_summary", return_value=generated_summary):
+            summary_code, summary = self.call(
+                f"/api/projects/{project_id}/agent/executions/{executed['report']['execution_id']}/summarize", {}, "POST")
+        self.assertEqual(summary_code, 201)
+        self.assertEqual(summary["status"], "ai-generated-unverified")
+        self.assertEqual(summary["evidence_keys"], ["topology.valid", "connectivity.net_count"])
+        self.assertEqual(summary["cited_evidence"], {"topology.valid": True, "connectivity.net_count": 2})
+        self.assertEqual(app_server.summary_report_digest(summary), summary["summary_report_sha256"])
+        summary_path = app_server.DATA_DIR / "projects" / project_id / summary["artifact"]
+        self.assertTrue(summary_path.is_file())
+        self.assertIn("AI-generated explanation", summary["limitations"][0])
+        summaries_url = f"/api/projects/{project_id}/agent/executions/{executed['report']['execution_id']}/summaries"
+        list_code, listed = self.call(summaries_url)
+        self.assertEqual(list_code, 200)
+        self.assertEqual(listed["summaries"][0]["integrity"], "verified")
+        self.assertEqual(listed["summaries"][0]["report"]["summary_report_sha256"], summary["summary_report_sha256"])
+        tampered_summary = json.loads(summary_path.read_text("utf-8"))
+        tampered_summary["summary"] = "An altered narrative"
+        summary_path.write_text(json.dumps(tampered_summary), encoding="utf-8")
+        _, listed_tampered = self.call(summaries_url)
+        self.assertEqual(listed_tampered["summaries"][0]["integrity"], "invalid-or-unlinked")
+        summary_path.write_bytes((json.dumps(summary, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
+        _, audited = self.call(f"/api/projects/{project_id}/agent/actions")
+        self.assertEqual(audited["actions"][-1]["tool"], "agent.execution.summarize")
+        self.assertEqual(audited["actions"][-1]["status"], "ai-generated-unverified")
+        execution_path = app_server.DATA_DIR / "projects" / project_id / executed["report"]["artifact"]
+        altered_report = json.loads(execution_path.read_text("utf-8"))
+        altered_report["evidence"]["topology"]["valid"] = False
+        execution_path.write_text(json.dumps(altered_report), encoding="utf-8")
+        with patch("circuitmind.server.generate_evidence_summary") as no_call:
+            tampered_code, tampered = self.call(
+                f"/api/projects/{project_id}/agent/executions/{executed['report']['execution_id']}/summarize", {}, "POST")
+        self.assertEqual(tampered_code, 409)
+        self.assertIn("integrity check failed", tampered["error"])
+        detail_code, detail_error = self.call(
+            f"/api/projects/{project_id}/agent/executions/{executed['report']['execution_id']}")
+        self.assertEqual(detail_code, 409)
+        self.assertIn("failed integrity verification", detail_error["error"])
+        history_code, changed_history = self.call(f"/api/projects/{project_id}/agent/executions")
+        self.assertEqual(history_code, 200)
+        self.assertEqual(changed_history["executions"][0]["integrity"], "invalid-or-unlinked")
+        no_call.assert_not_called()
+        saved_plan = json.loads(artifact.read_text("utf-8"))
+        self.assertEqual(saved_plan["status"], "executed")
+        self.assertEqual(saved_plan["execution_status"], "passed")
+
+    def test_agent_plan_hash_mismatch_is_rejected_before_execution(self):
+        _, created = self.call("/api/projects", {"name": "Tampered plan", "description": "Integrity check", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        model = self.sample_design()
+        self.assertEqual(self.call(f"/api/projects/{project_id}/circuit", {"model": model}, "PUT")[0], 200)
+        generated = {"provider": "ollama", "model": "fixture",
+                     "content": json.dumps({"summary": "Validate topology.", "calls": [
+                         {"tool": "circuit.validate", "arguments": {}}]}),
+                     "prompt_sha256": "5" * 64, "completion_sha256": "6" * 64}
+        with patch("circuitmind.server.generate_agent_plan", return_value=generated):
+            _, plan = self.call(f"/api/projects/{project_id}/agent/plan", {"prompt": "Validate topology"}, "POST")
+        plan_path = app_server.DATA_DIR / "projects" / project_id / plan["artifact"]
+        changed = json.loads(plan_path.read_text("utf-8")); changed["summary"] = "Changed after review"
+        plan_path.write_text(json.dumps(changed), encoding="utf-8")
+        code, error = self.call(plan["execution_url"], {"execute": True}, "POST")
+        self.assertEqual(code, 400)
+        self.assertIn("content hash does not match", error["error"])
+        _, actions = self.call(f"/api/projects/{project_id}/agent/actions")
+        self.assertEqual(len(actions["actions"]), 1)
+        self.assertEqual(actions["actions"][0]["status"], "awaiting-user-review")
+
+    def test_agent_plan_rejects_model_generated_mutation_without_execution(self):
+        _, created = self.call("/api/projects", {"name": "Unsafe agent plan", "description": "Fail closed on model output", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        unsafe = {"provider": "ollama", "model": "fixture",
+                  "content": json.dumps({"summary": "Replace model", "calls": [
+                      {"tool": "circuit.replace_model", "arguments": {}}]}),
+                  "prompt_sha256": "3" * 64, "completion_sha256": "4" * 64}
+        with patch("circuitmind.server.generate_agent_plan", return_value=unsafe):
+            code, rejected = self.call(f"/api/projects/{project_id}/agent/plan", {"prompt": "Change the circuit model"}, "POST")
+        self.assertEqual(code, 422)
+        self.assertIn("non-read-only", rejected["error"])
+        _, actions = self.call(f"/api/projects/{project_id}/agent/actions")
+        self.assertEqual(actions["actions"][-1]["status"], "plan-rejected")
+
+    def test_agent_provider_routes_are_opt_in_and_probe_requires_empty_request(self):
+        with patch.dict(os.environ, {"CIRCUITMIND_AGENT_PROVIDER": "", "CIRCUITMIND_AGENT_BASE_URL": "",
+                                    "CIRCUITMIND_AGENT_MODEL": "", "CIRCUITMIND_AGENT_API_KEY": ""}):
+            code, config = self.call("/api/agent/providers")
+            self.assertEqual(code, 200)
+            self.assertEqual(config["provider"]["status"], "not-configured")
+            code, probe = self.call("/api/agent/providers/probe", {}, "POST")
+            self.assertEqual(code, 200)
+            self.assertEqual(probe["status"], "not-configured")
+            code, rejected = self.call("/api/agent/providers/probe", {"provider": "ollama"}, "POST")
+            self.assertEqual(code, 400)
+            self.assertIn("empty JSON object", rejected["error"])
+            _, project = self.call("/api/projects", {"name": "No agent model", "description": "No provider configured", "inventory": "", "architecture": "discrete"}, "POST")
+            code, failure = self.call(f"/api/projects/{project['project_id']}/agent/plan", {"prompt": "Check topology"}, "POST")
+            self.assertEqual(code, 503)
+            self.assertIn("No local agent provider", failure["error"])
+            _, actions = self.call(f"/api/projects/{project['project_id']}/agent/actions")
+            self.assertEqual(actions["actions"][-1]["status"], "provider-error")
+
+    def test_deterministic_agent_circuit_review_runs_fixed_steps_and_persists_checks(self):
+        _, created = self.call("/api/projects", {"name": "Circuit review", "description": "Deterministic workflow", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        model = self.sample_design()
+        self.assertEqual(self.call(f"/api/projects/{project_id}/circuit", {"model": model}, "PUT")[0], 200)
+        code, catalog = self.call("/api/agent/workflows")
+        self.assertEqual(code, 200)
+        self.assertEqual([workflow["name"] for workflow in catalog["workflows"]], ["circuit_review"])
+        code, report = self.call(f"/api/projects/{project_id}/agent/workflows/run", {"workflow": "circuit_review"}, "POST")
+        self.assertEqual(code, 201)
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual([step["tool"] for step in report["steps"]], [
+            "project.summary", "circuit.validate", "circuit.connectivity_schedule"])
+        self.assertTrue(all(step["status"] == "completed" for step in report["steps"]))
+        self.assertTrue(all(check["passed"] for check in report["result"]["checks"]))
+        self.assertEqual(report["result"]["connectivity_summary"]["unconnected_pin_count"], 0)
+        self.assertIn("not an AI-generated plan", report["result"]["limitations"][0])
+        self.assertTrue((app_server.DATA_DIR / "projects" / project_id / report["artifact"]).is_file())
+        _, saved = self.call(f"/api/projects/{project_id}/circuit")
+        self.assertEqual(saved["model"], model)
+        _, actions = self.call(f"/api/projects/{project_id}/agent/actions")
+        self.assertEqual(actions["actions"][-1]["tool"], "workflow.circuit_review")
+
+    def test_deterministic_agent_review_fails_closed_on_corrupt_saved_model(self):
+        _, created = self.call("/api/projects", {"name": "Broken graph review", "description": "Fail closed", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        (app_server.DATA_DIR / "projects" / project_id / "circuit_model.json").write_text("{", encoding="utf-8")
+        code, report = self.call(f"/api/projects/{project_id}/agent/workflows/run", {"workflow": "circuit_review"}, "POST")
+        self.assertEqual(code, 201)
+        self.assertEqual(report["status"], "failed")
+        self.assertTrue(any(step["status"] == "failed" for step in report["steps"]))
+        self.assertFalse(all(check["passed"] for check in report["result"]["checks"]))
+
+    def test_agent_circuit_proposal_requires_separate_approval_and_is_one_time(self):
+        _, created = self.call("/api/projects", {"name": "Approval gate", "description": "Explicit circuit proposal", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        original = self.sample_design()
+        self.assertEqual(self.call(f"/api/projects/{project_id}/circuit", {"model": original}, "PUT")[0], 200)
+        candidate = json.loads(json.dumps(original))
+        candidate["components"][0]["value"] = "22k"
+        code, proposal_response = self.call(f"/api/projects/{project_id}/agent/proposals", {
+            "tool": "circuit.replace_model", "arguments": {"model": candidate}}, "POST")
+        self.assertEqual(code, 201)
+        proposal_id = proposal_response["proposal"]["proposal_id"]
+        self.assertTrue(proposal_response["requires_separate_approval"])
+        code, saved = self.call(f"/api/projects/{project_id}/circuit")
+        self.assertEqual(code, 200)
+        self.assertEqual(saved["model"], original)
+        code, details = self.call(proposal_response["review_url"])
+        self.assertEqual(code, 200)
+        self.assertEqual(details["proposal"]["candidate_model_sha256"], proposal_response["proposal"]["candidate_model_sha256"])
+        code, denied = self.call(proposal_response["approval_url"], {"approve": False}, "POST")
+        self.assertEqual(code, 400)
+        self.assertIn("explicit JSON", denied["error"])
+        code, applied = self.call(proposal_response["approval_url"], {"approve": True}, "POST")
+        self.assertEqual(code, 200)
+        self.assertEqual(applied["status"], "approved-and-applied")
+        code, saved = self.call(f"/api/projects/{project_id}/circuit")
+        self.assertEqual(code, 200)
+        self.assertEqual(saved["model"], candidate)
+        code, replay = self.call(proposal_response["approval_url"], {"approve": True}, "POST")
+        self.assertEqual(code, 409)
+        code, actions = self.call(f"/api/projects/{project_id}/agent/actions")
+        self.assertEqual(code, 200)
+        self.assertEqual([row["status"] for row in actions["actions"]], ["awaiting-approval", "approved-and-applied"])
+
+    def test_expired_agent_circuit_proposal_cannot_be_applied(self):
+        _, created = self.call("/api/projects", {"name": "Expired proposal", "description": "Approval timeout", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        original = self.sample_design()
+        self.assertEqual(self.call(f"/api/projects/{project_id}/circuit", {"model": original}, "PUT")[0], 200)
+        candidate = json.loads(json.dumps(original)); candidate["components"][0]["value"] = "12k"
+        _, prepared = self.call(f"/api/projects/{project_id}/agent/proposals", {
+            "tool": "circuit.replace_model", "arguments": {"model": candidate}}, "POST")
+        proposal_id = prepared["proposal"]["proposal_id"]
+        proposal_path = app_server.DATA_DIR / "projects" / project_id / f"agent_proposal_{proposal_id}.json"
+        proposal = json.loads(proposal_path.read_text("utf-8"))
+        proposal["expires_at"] = "2020-01-01T00:00:00+00:00"
+        proposal_path.write_text(json.dumps(proposal), encoding="utf-8")
+        code, response = self.call(prepared["approval_url"], {"approve": True}, "POST")
+        self.assertEqual(code, 410)
+        self.assertIn("expired", response["error"])
+        _, saved = self.call(f"/api/projects/{project_id}/circuit")
+        self.assertEqual(saved["model"], original)
+
+    def test_agent_proposal_becomes_stale_after_saved_circuit_changes(self):
+        _, created = self.call("/api/projects", {"name": "Stale proposal", "description": "Fresh model required", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        original = self.sample_design()
+        self.assertEqual(self.call(f"/api/projects/{project_id}/circuit", {"model": original}, "PUT")[0], 200)
+        candidate = json.loads(json.dumps(original)); candidate["components"][0]["value"] = "18k"
+        _, prepared = self.call(f"/api/projects/{project_id}/agent/proposals", {
+            "tool": "circuit.replace_model", "arguments": {"model": candidate}}, "POST")
+        changed = json.loads(json.dumps(original)); changed["components"][0]["value"] = "33k"
+        self.assertEqual(self.call(f"/api/projects/{project_id}/circuit", {"model": changed}, "PUT")[0], 200)
+        code, response = self.call(prepared["approval_url"], {"approve": True}, "POST")
+        self.assertEqual(code, 409)
+        self.assertIn("changed since proposal", response["error"])
+        _, saved = self.call(f"/api/projects/{project_id}/circuit")
+        self.assertEqual(saved["model"], changed)
+
+    def test_read_only_agent_tools_are_discovered_executed_and_audited(self):
+        _, created = self.call("/api/projects", {"name": "Agent tools", "description": "Read-only dispatch", "inventory": "", "architecture": "discrete"}, "POST")
+        project_id = created["project_id"]
+        model = self.sample_design()
+        self.assertEqual(self.call(f"/api/projects/{project_id}/circuit", {"model": model}, "PUT")[0], 200)
+        code, catalog = self.call("/api/agent/tools")
+        self.assertEqual(code, 200)
+        self.assertEqual({tool["permission"] for tool in catalog["tools"]}, {"read-only", "write-circuit"})
+        proposal_tool = next(tool for tool in catalog["tools"] if tool["name"] == "circuit.replace_model")
+        self.assertTrue(proposal_tool["requires_approval"])
+        self.assertEqual(proposal_tool["permission"], "write-circuit")
+        code, response = self.call(f"/api/projects/{project_id}/agent/execute", {"calls": [
+            {"tool": "project.summary", "arguments": {}},
+            {"tool": "circuit.validate", "arguments": {}},
+            {"tool": "circuit.connectivity_schedule", "arguments": {}},
+        ]}, "POST")
+        self.assertEqual(code, 200)
+        self.assertEqual(response["status"], "completed")
+        self.assertEqual([call["status"] for call in response["calls"]], ["completed"] * 3)
+        self.assertEqual(response["calls"][0]["output"]["project_id"], project_id)
+        self.assertTrue(response["calls"][1]["output"]["topology_report"]["topology_valid"])
+        self.assertEqual(response["calls"][2]["output"]["component_count"], 2)
+        self.assertTrue((app_server.DATA_DIR / "projects" / project_id / "agent_actions.jsonl").is_file())
+        code, audit = self.call(f"/api/projects/{project_id}/agent/actions")
+        self.assertEqual(code, 200)
+        self.assertEqual(audit["count"], 3)
+        self.assertEqual(audit["chain_integrity"]["status"], "intact")
+        self.assertTrue(audit["chain_integrity"]["verified"])
+        self.assertTrue(all(row["result_sha256"] and row["permission"] == "read-only" for row in audit["actions"]))
+        self.assertTrue(all("output" not in row and "arguments" not in row for row in audit["actions"]))
+        before = (app_server.DATA_DIR / "projects" / project_id / "circuit_model.json").read_bytes()
+        code, denied = self.call(f"/api/projects/{project_id}/agent/execute", {"calls": [
+            {"tool": "circuit.mutate", "arguments": {}}]}, "POST")
+        self.assertEqual(code, 400)
+        self.assertIn("unregistered", denied["error"])
+        self.assertEqual((app_server.DATA_DIR / "projects" / project_id / "circuit_model.json").read_bytes(), before)
+        code, gated = self.call(f"/api/projects/{project_id}/agent/execute", {"calls": [
+            {"tool": "circuit.replace_model", "arguments": {}}]}, "POST")
+        self.assertEqual(code, 400)
+        self.assertIn("separate proposal and approval", gated["error"])
+
+    def test_project_backup_imports_as_new_id_and_preserves_validated_graph(self):
+        _, created = self.call("/api/projects", {"name": "Backup roundtrip", "description": "Archive import test", "inventory": "", "architecture": "discrete"}, "POST")
+        source_id = created["project_id"]
+        model = self.sample_design()
+        self.assertEqual(self.call(f"/api/projects/{source_id}/circuit", {"model": model}, "PUT")[0], 200)
+        _, schedule = self.call(f"/api/projects/{source_id}/circuit/connectivity-schedule", {}, "POST")
+        with urllib.request.urlopen(self.base + f"/api/projects/{source_id}/export") as response:
+            archive_bytes = response.read()
+        code, imported = self.call_raw("/api/projects/import", archive_bytes, method="POST",
+                                       headers={"Content-Type": "application/zip"})
+        self.assertEqual(code, 201, imported)
+        new_id = imported["project"]["project_id"]
+        self.assertNotEqual(new_id, source_id)
+        self.assertEqual(imported["source_project_id"], source_id)
+        self.assertEqual(imported["project"]["imported_from_project_id"], source_id)
+        self.assertIn(schedule["artifact"], imported["project"]["artifacts"])
+        self.assertIn(schedule["csv_artifact"], imported["project"]["artifacts"])
+        code, circuit = self.call(f"/api/projects/{new_id}/circuit")
+        self.assertEqual(code, 200)
+        self.assertEqual(circuit["model"], model)
+        code, snapshots = self.call(f"/api/projects/{new_id}/snapshots")
+        self.assertEqual(code, 200)
+        self.assertEqual(snapshots["project_id"], new_id)
+        self.assertGreaterEqual(snapshots["count"], 1)
 
     def test_linear_dc_source_sweep_is_computed_and_persisted(self):
         _, created = self.call("/api/projects", {"name": "DC sweep", "description": "Source sweep", "inventory": "", "architecture": "discrete"}, "POST")

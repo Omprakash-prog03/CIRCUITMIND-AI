@@ -247,4 +247,108 @@ int cm_engine_simulate_ac_sweep_v1(const cm_ac_sweep_request_v1* request,
         return 2;
     }
 }
+
+int cm_engine_simulate_digital_truth_table_v1(
+    const cm_digital_truth_table_request_v1* request,
+    cm_digital_truth_table_result_v1* output,
+    char* error_message, size_t error_capacity) {
+    try {
+        if (request == nullptr) throw circuitmind::SolverError("digital truth-table request pointer must not be null");
+        if (output == nullptr) throw circuitmind::SolverError("digital truth-table result pointer must not be null");
+        if (request->request_version != 1) throw circuitmind::SolverError("only digital request_version 1 is supported");
+        if (request->net_count > 256 || request->gate_count > 512 ||
+            request->input_count > 10 || request->output_count > 32) {
+            throw circuitmind::SolverError("digital truth-table request exceeds configured net, gate, input, or output limits");
+        }
+        if (request->gates == nullptr || request->input_nets == nullptr || request->output_nets == nullptr) {
+            throw circuitmind::SolverError("digital truth-table gate and net-index arrays must not be null");
+        }
+        const size_t row_count = size_t{1} << request->input_count;
+        const size_t expected_values = row_count * request->output_count;
+        if (output->output_values == nullptr || output->output_capacity < expected_values) {
+            throw circuitmind::SolverError("digital truth-table output buffer is null or too small");
+        }
+        circuitmind::DigitalCircuit circuit;
+        circuit.net_count = request->net_count;
+        circuit.input_nets.assign(request->input_nets, request->input_nets + request->input_count);
+        circuit.output_nets.assign(request->output_nets, request->output_nets + request->output_count);
+        circuit.gates.reserve(request->gate_count);
+        for (uint32_t index = 0; index < request->gate_count; ++index) {
+            const auto& gate = request->gates[index];
+            if (gate.kind > static_cast<uint32_t>(circuitmind::DigitalGateKind::Xnor)) {
+                throw circuitmind::SolverError("digital gate has an unsupported kind code");
+            }
+            circuit.gates.push_back({static_cast<circuitmind::DigitalGateKind>(gate.kind),
+                                     gate.input_a, gate.input_b, gate.output, 0});
+        }
+        const auto solved = circuitmind::simulateDigitalTruthTable(circuit);
+        std::copy(solved.output_values.begin(), solved.output_values.end(), output->output_values);
+        output->row_count = solved.row_count;
+        output->output_count = solved.output_count;
+        setError(error_message, error_capacity, "");
+        return 0;
+    } catch (const std::exception& error) {
+        setError(error_message, error_capacity, error.what());
+        return 1;
+    } catch (...) {
+        setError(error_message, error_capacity, "unknown C++ engine failure");
+        return 2;
+    }
+}
+
+int cm_engine_simulate_digital_waveform_v1(
+    const cm_digital_waveform_request_v1* request,
+    cm_digital_waveform_result_v1* output,
+    char* error_message, size_t error_capacity) {
+    try {
+        if (request == nullptr) throw circuitmind::SolverError("digital waveform request pointer must not be null");
+        if (output == nullptr) throw circuitmind::SolverError("digital waveform result pointer must not be null");
+        if (request->request_version != 1) throw circuitmind::SolverError("only digital waveform request_version 1 is supported");
+        if (request->net_count > 256 || request->gate_count > 512 || request->input_count > 32 ||
+            request->output_count > 32 || request->sample_count == 0 || request->sample_count > 10000) {
+            throw circuitmind::SolverError("digital waveform request exceeds configured size limits");
+        }
+        if (request->gates == nullptr || request->input_nets == nullptr || request->output_nets == nullptr ||
+            request->primary_input_samples == nullptr || output->sample_times_s == nullptr ||
+            output->output_values == nullptr) {
+            throw circuitmind::SolverError("digital waveform input/output buffers must not be null");
+        }
+        const size_t input_value_count = request->sample_count * request->input_count;
+        const size_t output_value_count = request->sample_count * request->output_count;
+        if (output->sample_time_capacity < request->sample_count || output->output_capacity < output_value_count) {
+            throw circuitmind::SolverError("digital waveform result buffers are too small");
+        }
+        circuitmind::DigitalCircuit circuit;
+        circuit.net_count = request->net_count;
+        circuit.input_nets.assign(request->input_nets, request->input_nets + request->input_count);
+        circuit.output_nets.assign(request->output_nets, request->output_nets + request->output_count);
+        circuit.gates.reserve(request->gate_count);
+        for (uint32_t index = 0; index < request->gate_count; ++index) {
+            const auto& gate = request->gates[index];
+            if (gate.kind > static_cast<uint32_t>(circuitmind::DigitalGateKind::DFlipFlop)) {
+                throw circuitmind::SolverError("digital gate has an unsupported kind code");
+            }
+            circuit.gates.push_back({static_cast<circuitmind::DigitalGateKind>(gate.kind), gate.input_a,
+                                     gate.input_b, gate.output, gate.initial_value,
+                                     static_cast<circuitmind::DigitalClockEdge>(gate.active_edge)});
+        }
+        const std::vector<std::uint8_t> samples(request->primary_input_samples,
+                                                 request->primary_input_samples + input_value_count);
+        const auto solved = circuitmind::simulateDigitalWaveform(circuit, samples,
+                                                                 request->sample_count,
+                                                                 request->sample_interval_s);
+        std::copy(solved.sample_times_s.begin(), solved.sample_times_s.end(), output->sample_times_s);
+        std::copy(solved.output_values.begin(), solved.output_values.end(), output->output_values);
+        output->sample_count = solved.sample_times_s.size();
+        output->output_count = solved.output_count;
+        setError(error_message, error_capacity, "");
+        return 0;
+    } catch (const std::exception& error) {
+        setError(error_message, error_capacity, error.what());
+        return 1;
+    } catch (...) {
+        setError(error_message, error_capacity, "unknown C++ engine failure");
+        return 2;
+    }
+}
 }

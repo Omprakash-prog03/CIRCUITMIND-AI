@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(circuitmind_core VERSION 0.2.0 LANGUAGES CXX)
+project(circuitmind_core VERSION 0.3.0 LANGUAGES CXX)
 
 option(CIRCUITMIND_BUILD_TESTS "Build standalone native core tests" ON)
 set(CMAKE_CXX_STANDARD 20)
